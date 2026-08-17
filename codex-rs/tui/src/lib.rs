@@ -1666,6 +1666,7 @@ async fn run_ratatui_app(
         app_server,
         config,
         current_cwd.to_path_buf(),
+        /*resume_picker_show_all*/ cli.resume_show_all,
         cli_kv_overrides.clone(),
         overrides.clone(),
         loader_overrides.clone(),

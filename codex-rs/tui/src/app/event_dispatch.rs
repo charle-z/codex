@@ -171,7 +171,7 @@ impl App {
                 match crate::resume_picker::run_resume_picker_from_existing_session_with_app_server(
                     tui,
                     &self.config,
-                    /*show_all*/ false,
+                    /*show_all*/ self.resume_picker_show_all,
                     /*include_non_interactive*/ false,
                     picker_app_server,
                     app_server.request_handle(),

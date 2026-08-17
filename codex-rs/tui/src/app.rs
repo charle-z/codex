@@ -523,6 +523,8 @@ pub(crate) struct App {
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
     launch_cwd: PathBuf,
+    /// Whether in-session resume pickers should start without a CWD filter.
+    resume_picker_show_all: bool,
     /// Resume anchor selected by `/cd`; ordinary resumes retain the immutable launch cwd.
     runtime_working_directory_override: Option<PathBuf>,
     pub(crate) state_db: Option<StateDbHandle>,
