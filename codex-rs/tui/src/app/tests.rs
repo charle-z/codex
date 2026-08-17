@@ -156,6 +156,17 @@ fn test_absolute_path(path: &str) -> AbsolutePathBuf {
 }
 
 #[tokio::test]
+async fn resume_picker_show_all_preference_is_retained_by_app() {
+    let mut app = make_test_app().await;
+
+    assert!(!app.resume_picker_show_all);
+
+    app.resume_picker_show_all = true;
+
+    assert!(app.resume_picker_show_all);
+}
+
+#[tokio::test]
 async fn pasted_text_normalizes_mixed_line_endings_at_app_boundary() -> Result<()> {
     let mut app = make_test_app().await;
     let mut app_server = start_config_write_test_app_server(&app).await?;
@@ -4867,6 +4878,7 @@ async fn make_test_app() -> App {
         chat_widget,
         workspace_command_runner: None,
         launch_cwd: config.cwd.to_path_buf(),
+        resume_picker_show_all: false,
         config,
         state_db: None,
         cli_kv_overrides: Vec::new(),
@@ -4942,6 +4954,7 @@ async fn make_test_app_with_channels() -> (
             chat_widget,
             workspace_command_runner: None,
             launch_cwd: config.cwd.to_path_buf(),
+            resume_picker_show_all: false,
             config,
             state_db: None,
             cli_kv_overrides: Vec::new(),

@@ -522,6 +522,8 @@ pub(crate) struct App {
     /// Config is stored here so we can recreate ChatWidgets as needed.
     pub(crate) config: Config,
     launch_cwd: PathBuf,
+    /// Whether resume pickers opened in this TUI should start in the all-CWD view.
+    resume_picker_show_all: bool,
     pub(crate) state_db: Option<StateDbHandle>,
     cli_kv_overrides: Vec<(String, TomlValue)>,
     harness_overrides: ConfigOverrides,
