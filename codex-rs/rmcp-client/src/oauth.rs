@@ -58,6 +58,7 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tracing::warn;
 
+use self::refresh_lock::RefreshCredentialLock;
 use self::store_lock::OAuthStore;
 use self::store_lock::OAuthStoreLock;
 use self::store_lock::OAuthStoreLockFailure;
@@ -65,6 +66,7 @@ use self::store_lock::OAuthStoreLockFailure;
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
 use rmcp::transport::auth::AuthorizationManager;
+use rmcp::transport::auth::InMemoryCredentialStore;
 use tokio::sync::Mutex;
 
 use codex_utils_home_dir::find_codex_home;
@@ -677,6 +679,62 @@ impl OAuthPersistor {
         reason = "AuthorizationManager async access must be serialized through its mutex"
     )]
     pub(crate) async fn persist_if_needed(&self) -> Result<()> {
+        // This hook runs after ordinary MCP operations, so keep the no-change path entirely
+        // in-memory. Cross-process coordination is only needed when RMCP actually changed the
+        // credential that this client would otherwise persist or remove.
+        let (client_id, maybe_credentials) = {
+            let manager = self.inner.authorization_manager.clone();
+            let guard = manager.lock().await;
+            guard.get_credentials().await
+        }?;
+        let locally_changed = {
+            let last_credentials = self.inner.last_credentials.lock().await;
+            match maybe_credentials.as_ref() {
+                Some(credentials) => {
+                    let token_response = WrappedOAuthTokenResponse(credentials.clone());
+                    last_credentials.as_ref().is_none_or(|previous| {
+                        previous.client_id != client_id || previous.token_response != token_response
+                    })
+                }
+                None => last_credentials.is_some(),
+            }
+        };
+        if !locally_changed {
+            return Ok(());
+        }
+
+        let _lock =
+            RefreshCredentialLock::acquire_for_server(&self.inner.server_name, &self.inner.url)
+                .await?;
+        let authoritative = self.inner.credential_store.load(
+            &DefaultKeyringStore,
+            &self.inner.server_name,
+            &self.inner.url,
+        )?;
+        let previously_observed = {
+            let last_credentials = self.inner.last_credentials.lock().await;
+            normalized_oauth_credentials(last_credentials.as_ref())
+        };
+
+        // The legacy RMCP persistence hook can run after another process has refreshed or
+        // invalidated the same credential. Never let its stale in-memory copy overwrite that
+        // newer authoritative state (including resurrecting a rejected refresh capability).
+        if normalized_oauth_credentials(authoritative.as_ref()) != previously_observed {
+            let manager = self.inner.authorization_manager.clone();
+            let mut guard = manager.lock().await;
+            if let Some(tokens) = authoritative.as_ref() {
+                refresh_transaction::install_tokens_in_manager_guard(&mut guard, tokens)
+                    .await
+                    .context(
+                        "failed to adopt authoritative OAuth credentials before persistence",
+                    )?;
+            } else {
+                guard.set_credential_store(InMemoryCredentialStore::new());
+            }
+            *self.inner.last_credentials.lock().await = authoritative;
+            return Ok(());
+        }
+
         let (client_id, maybe_credentials) = {
             let manager = self.inner.authorization_manager.clone();
             let guard = manager.lock().await;
