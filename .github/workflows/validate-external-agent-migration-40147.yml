@@ -1,0 +1,43 @@
+name: validate-external-agent-migration-40147
+
+on:
+  pull_request:
+    branches:
+      - validation/base-40147-c9b19
+    paths:
+      - "codex-rs/external-agent-migration/**"
+
+permissions:
+  contents: read
+
+jobs:
+  migration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+          version: 0.9.103
+      - name: Assert exact source shape
+        run: |
+          test "$(git rev-list --count c9b19deb09c1841ce7acc33ddb96276030936a29..HEAD)" -eq 1
+          test -z "$(git rev-list HEAD..c9b19deb09c1841ce7acc33ddb96276030936a29)"
+          files="$(git diff --name-only c9b19deb09c1841ce7acc33ddb96276030936a29...HEAD | sort)"
+          expected=$'codex-rs/external-agent-migration/src/rewrite.rs\ncodex-rs/external-agent-migration/src/rewrite_tests.rs'
+          test "$files" = "$expected"
+      - name: Test external-agent migration through repository harness
+        run: just test -p codex-external-agent-migration
+      - name: Apply scoped clippy fixes
+        run: just fix -p codex-external-agent-migration
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Verify scoped validation did not change tracked files
+        run: git diff --exit-code
