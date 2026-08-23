@@ -1,0 +1,1 @@
+Validation-only marker. Source branch remains unchanged.
