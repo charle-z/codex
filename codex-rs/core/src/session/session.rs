@@ -624,6 +624,17 @@ async fn warm_plugins_and_skills_for_session_init(
         .clone()
 }
 
+fn session_start_source_for_initial_history(
+    initial_history: &InitialHistory,
+) -> codex_hooks::SessionStartSource {
+    match initial_history {
+        InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
+        InitialHistory::Forked(_) => codex_hooks::SessionStartSource::Fork,
+        InitialHistory::New => codex_hooks::SessionStartSource::Startup,
+        InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
+    }
+}
+
 impl Session {
     /// Returns the concrete identity for this thread.
     pub(crate) fn thread_id(&self) -> ThreadId {
@@ -1563,13 +1574,8 @@ impl Session {
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
             sess.schedule_startup_prewarm(session_configuration.base_instructions.clone())
                 .await;
-            let session_start_source = match &initial_history {
-                InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
-                InitialHistory::New | InitialHistory::Forked(_) => {
-                    codex_hooks::SessionStartSource::Startup
-                }
-                InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
-            };
+            let session_start_source =
+                session_start_source_for_initial_history(&initial_history);
 
             // record_initial_history can emit events. We record only after the SessionConfiguredEvent is emitted.
             Box::pin(sess.record_initial_history(initial_history)).await;
@@ -1601,5 +1607,17 @@ impl Session {
                 Err(err)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod session_start_source_tests {
+    use super::*;
+
+    #[test]
+    fn forked_initial_history_uses_fork_session_start_source() {
+        let source = session_start_source_for_initial_history(&InitialHistory::Forked(Vec::new()));
+
+        assert_eq!(source.as_str(), "fork");
     }
 }
