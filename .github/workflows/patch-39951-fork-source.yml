@@ -1,0 +1,57 @@
+name: patch-39951-fork-source
+
+on:
+  push:
+    branches:
+      - automation/39951-map-fork-source-v1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source
+          persist-credentials: true
+
+      - name: Apply exact mapping change
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('codex-rs/core/src/session/session.rs')
+          text = path.read_text()
+          old = '''            let session_start_source = match &initial_history {
+                  InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
+                  InitialHistory::New | InitialHistory::Forked(_) => {
+                      codex_hooks::SessionStartSource::Startup
+                  }
+                  InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
+              };'''
+          new = '''            let session_start_source = match &initial_history {
+                  InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,
+                  InitialHistory::Forked(_) => codex_hooks::SessionStartSource::Fork,
+                  InitialHistory::New => codex_hooks::SessionStartSource::Startup,
+                  InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,
+              };'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one mapping block, found {text.count(old)}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+          test "$(git diff --name-only | wc -l)" -eq 1
+          test "$(git diff --name-only)" = "codex-rs/core/src/session/session.rs"
+
+      - name: Commit source change
+        shell: bash
+        run: |
+          git config user.name "Carlos Acosta"
+          git config user.email "93443910+charle-z@users.noreply.github.com"
+          git add codex-rs/core/src/session/session.rs
+          git commit -m "fix(core): classify fork session start source"
+          git push origin HEAD:fix/39951-session-start-fork-source
