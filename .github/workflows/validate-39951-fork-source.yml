@@ -4,6 +4,9 @@ on:
   pull_request:
     branches:
       - validation/base-39951-focal
+    types:
+      - opened
+      - reopened
 
 permissions:
   contents: write
