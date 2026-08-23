@@ -1,0 +1,1 @@
+Trigger isolated Windows PreToolUse validation for issue #24453.
