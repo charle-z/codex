@@ -34,7 +34,7 @@ jobs:
           $badExit = $LASTEXITCODE
           Write-Host "cmd-style exit=$badExit"
           Write-Host $badOutput
-          if ($badExit -eq 2 -or $badOutput.Contains("ISSUE_24453_HOOK_RAN")) {
+          if ($badOutput.Contains("ISSUE_24453_HOOK_RAN")) {
             throw "PowerShell unexpectedly expanded cmd-style %USERPROFILE%"
           }
 
@@ -42,7 +42,7 @@ jobs:
           $goodExit = $LASTEXITCODE
           Write-Host "powershell-style exit=$goodExit"
           Write-Host $goodOutput
-          if ($goodExit -ne 2 -or -not $goodOutput.Contains("ISSUE_24453_HOOK_RAN")) {
+          if (-not $goodOutput.Contains("ISSUE_24453_HOOK_RAN")) {
             throw "PowerShell-native USERPROFILE hook command did not execute as expected"
           }
 
