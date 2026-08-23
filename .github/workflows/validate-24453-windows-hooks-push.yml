@@ -1,0 +1,59 @@
+name: validate-24453-windows-hooks-push
+
+on:
+  push:
+    branches:
+      - validation/24453-windows-hooks-push-v1
+
+permissions:
+  contents: read
+
+jobs:
+  windows-hooks:
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Prove cmd-style USERPROFILE is not PowerShell expansion
+        shell: pwsh
+        run: |
+          $hookHome = Join-Path $env:RUNNER_TEMP "issue-24453-userprofile"
+          New-Item -ItemType Directory -Force -Path $hookHome | Out-Null
+          $hookPath = Join-Path $hookHome "hook.cmd"
+          $markerPath = Join-Path $hookHome "ran.marker"
+          @"
+          @echo off
+          echo ran>"$markerPath"
+          exit /B 0
+          "@ | Set-Content -Path $hookPath -Encoding ascii
+
+          $env:USERPROFILE = $hookHome
+          Remove-Item -Force -ErrorAction SilentlyContinue $markerPath
+
+          & powershell.exe -NoProfile -Command '%USERPROFILE%\hook.cmd' 2>&1 | Out-String | Write-Host
+          if (Test-Path $markerPath) {
+            throw "PowerShell unexpectedly expanded cmd-style %USERPROFILE%"
+          }
+
+          & powershell.exe -NoProfile -Command '& "$env:USERPROFILE\hook.cmd"' 2>&1 | Out-String | Write-Host
+          if (-not (Test-Path $markerPath)) {
+            throw "PowerShell-native USERPROFILE command did not execute the hook"
+          }
+
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Run hooks crate on Windows
+        working-directory: codex-rs
+        run: cargo test -p codex-hooks -- --nocapture
+
+      - name: Verify PreToolUse blocks shell execution
+        working-directory: codex-rs
+        run: cargo test -p codex-core pre_tool_use_blocks_shell_when_defined_in_config_toml -- --nocapture
+
+      - name: Verify exec_command PreToolUse rewrite path
+        working-directory: codex-rs
+        run: cargo test -p codex-core pre_tool_use_rewrites_exec_command_before_execution -- --nocapture
