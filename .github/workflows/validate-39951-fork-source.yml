@@ -42,10 +42,6 @@ jobs:
           test_module = '''\n\n#[cfg(test)]\nmod session_start_source_tests {\n    use super::*;\n\n    #[test]\n    fn forked_initial_history_uses_fork_session_start_source() {\n        let source = session_start_source_for_initial_history(&InitialHistory::Forked(Vec::new()));\n\n        assert_eq!(source.as_str(), "fork");\n    }\n}\n'''
           if 'fn forked_initial_history_uses_fork_session_start_source()' in text:
               raise SystemExit('fork source regression test already exists unexpectedly')
-          text = text.replace(impl_marker, helper, 1)
-          if text.count(old_mapping) != 1:
-              raise SystemExit(f'expected one SessionStart mapping block, found {text.count(old_mapping)}')
-          text = text.replace(old_mapping, new_mapping, 1)
           text = text.rstrip() + test_module
           path.write_text(text)
           PY
