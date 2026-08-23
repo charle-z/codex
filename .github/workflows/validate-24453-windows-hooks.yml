@@ -46,6 +46,11 @@ jobs:
             throw "PowerShell-native USERPROFILE hook command did not execute as expected"
           }
 
+          # The nested PowerShell process leaves its native exit status in
+          # $LASTEXITCODE. The assertions above use the execution marker as the
+          # discriminator, so do not leak that nested status to the workflow step.
+          exit 0
+
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
 
