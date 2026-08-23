@@ -1,9 +1,9 @@
 name: probe-24453-windows-pretooluse
 
 on:
-  push:
+  pull_request:
     branches:
-      - probe/24453-windows-pretooluse-v1
+      - validate/24453-windows-pretooluse-v1
 
 jobs:
   windows-pretooluse:
