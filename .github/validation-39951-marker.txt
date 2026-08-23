@@ -1,0 +1,1 @@
+Validation-only base for openai/codex#39951. blocking-ci and v8-canary are intentionally absent here; do not merge.
