@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::Context;
 use anyhow::Result;
 use codex_config::test_support::CloudConfigBundleFixture;
+use codex_core::ForkSnapshot;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInputRequest;
 use codex_core::config::Config;
@@ -1601,6 +1602,75 @@ async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<
         Some("hello")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_thread_session_start_hook_uses_fork_source() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let _responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-parent"),
+                ev_assistant_message("msg-parent", "parent turn complete"),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-fork"),
+                ev_assistant_message("msg-fork", "fork turn complete"),
+                ev_completed("resp-fork"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            write_session_start_and_user_prompt_submit_order_hooks(home)
+                .expect("failed to write hook ordering fixtures");
+        })
+        .with_config(trust_discovered_hooks);
+    let test = builder.build(&server).await?;
+
+    test.submit_turn("parent prompt").await?;
+    test.codex.flush_rollout().await?;
+    let rollout_path = test.codex.rollout_path().expect("parent rollout path");
+    let forked = test
+        .thread_manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            test.config.clone(),
+            rollout_path,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+        )
+        .await?
+        .thread;
+
+    forked
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "fork prompt".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&forked, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let session_start_sources = read_hook_order_inputs(test.codex_home_path())?
+        .into_iter()
+        .filter(|input| input["hook_event_name"] == "SessionStart")
+        .map(|input| {
+            input["source"]
+                .as_str()
+                .expect("SessionStart source")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(session_start_sources, vec!["startup", "fork"]);
+
+    forked.shutdown_and_wait().await?;
     Ok(())
 }
 
