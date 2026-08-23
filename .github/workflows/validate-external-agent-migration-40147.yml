@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
+          ref: fix/40147-preserve-external-agent-references-v4
+          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -27,6 +29,7 @@ jobs:
           version: 0.9.103
       - name: Assert exact source shape
         run: |
+          test "$(git rev-parse HEAD)" = "cc3b3697867dbd3854c84c90982bca05f836afe6"
           test "$(git rev-list --count c9b19deb09c1841ce7acc33ddb96276030936a29..HEAD)" -eq 1
           test -z "$(git rev-list HEAD..c9b19deb09c1841ce7acc33ddb96276030936a29)"
           files="$(git diff --name-only c9b19deb09c1841ce7acc33ddb96276030936a29...HEAD | sort)"
