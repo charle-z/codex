@@ -1,0 +1,226 @@
+name: validate-39951-fork-source-v2
+
+on:
+  pull_request:
+    branches:
+      - validation/base-39951-fork-source-v2
+    types:
+      - opened
+      - reopened
+
+permissions:
+  contents: write
+
+jobs:
+  focal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source-v2
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Assert exact upstream base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "c9b19deb09c1841ce7acc33ddb96276030936a29"
+
+      - name: Apply exact fork-source patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path: str, old: str, new: str) -> None:
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, found {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              "codex-rs/hooks/src/events/session_start.rs",
+              '''pub enum SessionStartSource {\n    Startup,\n    Resume,\n    Clear,\n    Compact,\n}''',
+              '''pub enum SessionStartSource {\n    Startup,\n    Resume,\n    Clear,\n    Compact,\n    Fork,\n}''',
+          )
+          replace_once(
+              "codex-rs/hooks/src/events/session_start.rs",
+              '''            Self::Startup => "startup",\n            Self::Resume => "resume",\n            Self::Clear => "clear",\n            Self::Compact => "compact",''',
+              '''            Self::Startup => "startup",\n            Self::Resume => "resume",\n            Self::Clear => "clear",\n            Self::Compact => "compact",\n            Self::Fork => "fork",''',
+          )
+
+          replace_once(
+              "codex-rs/core/src/session/session.rs",
+              '''            let session_start_source = match &initial_history {\n                InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,\n                InitialHistory::New | InitialHistory::Forked(_) => {\n                    codex_hooks::SessionStartSource::Startup\n                }\n                InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,\n            };''',
+              '''            let session_start_source = match &initial_history {\n                InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,\n                InitialHistory::Forked(_) => codex_hooks::SessionStartSource::Fork,\n                InitialHistory::New => codex_hooks::SessionStartSource::Startup,\n                InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,\n            };''',
+          )
+
+          replace_once(
+              "codex-rs/hooks/src/schema.rs",
+              '''fn session_start_source_schema(_gen: &mut SchemaGenerator) -> Schema {\n    string_enum_schema(&["startup", "resume", "clear", "compact"])\n}''',
+              '''fn session_start_source_schema(_gen: &mut SchemaGenerator) -> Schema {\n    string_enum_schema(&["startup", "resume", "clear", "compact", "fork"])\n}''',
+          )
+
+          replace_once(
+              "codex-rs/core/tests/suite/hooks.rs",
+              '''use codex_core::StartThreadOptions;\nuse codex_core::TurnInputRequest;''',
+              '''use codex_core::ForkSnapshot;\nuse codex_core::StartThreadOptions;\nuse codex_core::TurnInputRequest;''',
+          )
+
+          anchor = '''    assert_eq!(\n        hook_inputs[1].get("prompt").and_then(Value::as_str),\n        Some("hello")\n    );\n\n    Ok(())\n}\n\n#[tokio::test]\nasync fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {'''
+          replacement = '''    assert_eq!(\n        hook_inputs[1].get("prompt").and_then(Value::as_str),\n        Some("hello")\n    );\n\n    Ok(())\n}\n\n#[tokio::test]\nasync fn forked_thread_session_start_hook_uses_fork_source() -> Result<()> {\n    skip_if_no_network!(Ok(()));\n\n    let server = start_mock_server().await;\n    let _responses = mount_sse_sequence(\n        &server,\n        vec![\n            sse(vec![\n                ev_response_created("resp-parent"),\n                ev_assistant_message("msg-parent", "parent turn complete"),\n                ev_completed("resp-parent"),\n            ]),\n            sse(vec![\n                ev_response_created("resp-fork"),\n                ev_assistant_message("msg-fork", "fork turn complete"),\n                ev_completed("resp-fork"),\n            ]),\n        ],\n    )\n    .await;\n\n    let mut builder = test_codex()\n        .with_pre_build_hook(|home| {\n            write_session_start_and_user_prompt_submit_order_hooks(home)\n                .expect("failed to write hook ordering fixtures");\n        })\n        .with_config(trust_discovered_hooks);\n    let test = builder.build(&server).await?;\n\n    test.submit_turn("parent prompt").await?;\n    test.codex.flush_rollout().await?;\n    let rollout_path = test.codex.rollout_path().expect("parent rollout path");\n    let forked = test\n        .thread_manager\n        .fork_thread(\n            ForkSnapshot::Interrupted,\n            test.config.clone(),\n            rollout_path,\n            /*thread_source*/ None,\n            /*parent_trace*/ None,\n        )\n        .await?\n        .thread;\n\n    forked\n        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {\n            text: "fork prompt".to_string(),\n            text_elements: Vec::new(),\n        }]))\n        .await?;\n    wait_for_event(&forked, |event| matches!(event, EventMsg::TurnComplete(_))).await;\n\n    let session_start_sources = read_hook_order_inputs(test.codex_home_path())?\n        .into_iter()\n        .filter(|input| input["hook_event_name"] == "SessionStart")\n        .map(|input| {\n            input["source"]\n                .as_str()\n                .expect("SessionStart source")\n                .to_string()\n        })\n        .collect::<Vec<_>>();\n    assert_eq!(session_start_sources, vec!["startup", "fork"]);\n\n    forked.shutdown_and_wait().await?;\n    Ok(())\n}\n\n#[tokio::test]\nasync fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {'''
+          replace_once("codex-rs/core/tests/suite/hooks.rs", anchor, replacement)
+          PY
+
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          actual = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f"unexpected pre-generation diff: {sorted(actual)}")
+          PY
+          git diff --check
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.103
+
+      - name: Regenerate hook schema and format
+        shell: bash
+        run: |
+          set -euo pipefail
+          just write-hooks-schema
+          cargo fmt --manifest-path codex-rs/Cargo.toml --all
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/schema/generated/session-start.command.input.schema.json",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          actual = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f"unexpected generated diff: {sorted(actual)}")
+          PY
+          git diff --check
+          grep -q '"fork"' codex-rs/hooks/schema/generated/session-start.command.input.schema.json
+
+      - name: Commit candidate locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Carlos Acosta"
+          git config user.email "93443910+charle-z@users.noreply.github.com"
+          git add \
+            codex-rs/core/src/session/session.rs \
+            codex-rs/core/tests/suite/hooks.rs \
+            codex-rs/hooks/schema/generated/session-start.command.input.schema.json \
+            codex-rs/hooks/src/events/session_start.rs \
+            codex-rs/hooks/src/schema.rs
+          git commit -m "fix(core): distinguish fork session start hooks"
+
+      - name: Test generated hook contract
+        working-directory: codex-rs
+        run: just test -p codex-hooks generated_hook_schemas_match_fixtures
+
+      - name: Test fork SessionStart behavior
+        working-directory: codex-rs
+        run: just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+
+      - name: Test hooks crate
+        working-directory: codex-rs
+        run: just test -p codex-hooks
+
+      - name: Apply crate lint fixes
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          just fix -p codex-hooks
+          just fix -p codex-core
+          just fmt
+
+      - name: Verify lint scope and amend if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          python3 - <<'PY'
+          import subprocess
+          allowed = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/schema/generated/session-start.command.input.schema.json",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          changed = set(subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines())
+          unexpected = changed - allowed
+          if unexpected:
+              raise SystemExit(f"lint changed unexpected files: {sorted(unexpected)}")
+          PY
+          if ! git diff --quiet; then
+            git add \
+              codex-rs/core/src/session/session.rs \
+              codex-rs/core/tests/suite/hooks.rs \
+              codex-rs/hooks/schema/generated/session-start.command.input.schema.json \
+              codex-rs/hooks/src/events/session_start.rs \
+              codex-rs/hooks/src/schema.rs
+            git commit --amend --no-edit
+          fi
+
+      - name: Recheck behavior after lint fixes
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          just test -p codex-hooks generated_hook_schemas_match_fixtures
+          just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+          just fmt-check
+
+      - name: Verify final source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check c9b19deb09c1841ce7acc33ddb96276030936a29..HEAD
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/schema/generated/session-start.command.input.schema.json",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          actual = set(subprocess.check_output([
+              "git", "diff", "--name-only",
+              "c9b19deb09c1841ce7acc33ddb96276030936a29..HEAD"
+          ], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f"unexpected final diff: {sorted(actual)}")
+          PY
+          test -z "$(git status --porcelain)"
+
+      - name: Publish validated source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin HEAD:fix/39951-session-start-fork-source-v2
