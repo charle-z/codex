@@ -2,6 +2,7 @@ use super::*;
 use crate::migrations::runtime_logs_migrator;
 use crate::runtime::test_support::unique_temp_dir;
 use codex_utils_absolute_path::AbsolutePathBuf;
+use pretty_assertions::assert_eq;
 
 #[tokio::test]
 async fn locked_persistent_logs_db_falls_back_to_in_memory_store() {
