@@ -201,11 +201,7 @@ impl SqliteConfig {
                     error = %err,
                     "log database is locked; continuing with an in-memory log store"
                 );
-                telemetry::record_fallback(
-                    "open_logs_db",
-                    "locked",
-                    telemetry_override,
-                );
+                telemetry::record_fallback("open_logs_db", "locked", telemetry_override);
                 self.open_ephemeral_logs_db(migrator, telemetry_override)
                     .await
                     .map_err(|fallback_err| {
