@@ -65,10 +65,7 @@ fn replace_with_boundaries(input: &str, needle: &str, replacement: &str) -> Stri
         let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
         let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
 
-        if boundary_before
-            && boundary_after
-            && !is_literal_reference_match(bytes, start, end)
-        {
+        if boundary_before && boundary_after && !is_literal_reference_match(bytes, start, end) {
             output.push_str(&input[last_emitted..start]);
             output.push_str(replacement);
             last_emitted = end;
@@ -107,10 +104,7 @@ fn replace_case_insensitive_with_boundaries(
         let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
         let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
 
-        if boundary_before
-            && boundary_after
-            && !is_literal_reference_match(bytes, start, end)
-        {
+        if boundary_before && boundary_after && !is_literal_reference_match(bytes, start, end) {
             output.push_str(&input[last_emitted..start]);
             output.push_str(replacement);
             last_emitted = end;
