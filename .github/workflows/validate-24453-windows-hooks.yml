@@ -1,0 +1,62 @@
+name: validate-24453-windows-hooks
+
+on:
+  pull_request:
+    branches:
+      - validation/base-24453-eff640f
+
+permissions:
+  contents: read
+
+jobs:
+  windows-hooks:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Reproduce cmd-style USERPROFILE under PowerShell
+        shell: pwsh
+        run: |
+          $hookHome = Join-Path $env:RUNNER_TEMP "issue-24453-userprofile"
+          New-Item -ItemType Directory -Force -Path $hookHome | Out-Null
+          $hookPath = Join-Path $hookHome "hook.cmd"
+          @"
+          @echo off
+          echo ISSUE_24453_HOOK_RAN 1>&2
+          exit /B 2
+          "@ | Set-Content -Path $hookPath -Encoding ascii
+
+          $env:USERPROFILE = $hookHome
+
+          $badOutput = & powershell.exe -NoProfile -Command '%USERPROFILE%\hook.cmd' 2>&1 | Out-String
+          $badExit = $LASTEXITCODE
+          Write-Host "cmd-style exit=$badExit"
+          Write-Host $badOutput
+          if ($badExit -eq 2 -or $badOutput.Contains("ISSUE_24453_HOOK_RAN")) {
+            throw "PowerShell unexpectedly expanded cmd-style %USERPROFILE%"
+          }
+
+          $goodOutput = & powershell.exe -NoProfile -Command '& "$env:USERPROFILE\hook.cmd"' 2>&1 | Out-String
+          $goodExit = $LASTEXITCODE
+          Write-Host "powershell-style exit=$goodExit"
+          Write-Host $goodOutput
+          if ($goodExit -ne 2 -or -not $goodOutput.Contains("ISSUE_24453_HOOK_RAN")) {
+            throw "PowerShell-native USERPROFILE hook command did not execute as expected"
+          }
+
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Run existing Windows hook-command regression
+        working-directory: codex-rs
+        run: cargo test -p codex-hooks cmd_shell_runs_quoted_hook_command_path -- --nocapture
+
+      - name: Run existing PreToolUse config blocking regression
+        working-directory: codex-rs
+        run: cargo test -p codex-core pre_tool_use_blocks_shell_when_defined_in_config_toml -- --nocapture
+
+      - name: Run existing exec_command PreToolUse regression
+        working-directory: codex-rs
+        run: cargo test -p codex-core pre_tool_use_rewrites_exec_command_before_execution -- --nocapture
