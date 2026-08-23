@@ -25,6 +25,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+use tracing::warn;
 
 const LOGS_DB_FILENAME: &str = "logs_2.sqlite";
 const GOALS_DB_FILENAME: &str = "goals_1.sqlite";
@@ -188,8 +189,34 @@ impl SqliteConfig {
         migrator: &Migrator,
         telemetry_override: Option<&dyn DbTelemetry>,
     ) -> anyhow::Result<SqlitePool> {
-        self.open_runtime_db(LOGS_DB, migrator, telemetry_override)
+        match self
+            .open_runtime_db(LOGS_DB, migrator, telemetry_override)
             .await
+        {
+            Ok(pool) => Ok(pool),
+            Err(err) if sqlite_error_is_lock(&err) => {
+                let logs_path = self.logs_db_path();
+                warn!(
+                    path = %logs_path.display(),
+                    error = %err,
+                    "log database is locked; continuing with an in-memory log store"
+                );
+                telemetry::record_fallback(
+                    "open_logs_db",
+                    "locked",
+                    telemetry_override,
+                );
+                self.open_ephemeral_logs_db(migrator, telemetry_override)
+                    .await
+                    .map_err(|fallback_err| {
+                        anyhow::anyhow!(
+                            "persistent log database at {} is locked ({err:#}); failed to initialize in-memory log store: {fallback_err:#}",
+                            logs_path.display()
+                        )
+                    })
+            }
+            Err(err) => Err(err),
+        }
     }
 
     pub(super) async fn open_goals_db(
@@ -274,6 +301,46 @@ impl SqliteConfig {
         Ok(pool)
     }
 
+    async fn open_ephemeral_logs_db(
+        &self,
+        migrator: &Migrator,
+        telemetry_override: Option<&dyn DbTelemetry>,
+    ) -> anyhow::Result<SqlitePool> {
+        let options = SqliteConnectOptions::new()
+            .filename(":memory:")
+            .create_if_missing(true)
+            .log_statements(LevelFilter::Off);
+        let started = Instant::now();
+        let pool_result = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .map_err(anyhow::Error::from);
+        telemetry::record_init_result(
+            telemetry_override,
+            DbKind::Logs,
+            "open_logs_fallback",
+            started.elapsed(),
+            &pool_result,
+        );
+        let pool = pool_result?;
+
+        let started = Instant::now();
+        let migrate_result = migrator.run(&pool).await.map_err(anyhow::Error::from);
+        telemetry::record_init_result(
+            telemetry_override,
+            DbKind::Logs,
+            "migrate_logs_fallback",
+            started.elapsed(),
+            &migrate_result,
+        );
+        if let Err(err) = migrate_result {
+            pool.close().await;
+            return Err(err);
+        }
+        Ok(pool)
+    }
+
     /// Open a writable Codex SQLite database, creating it if necessary.
     pub async fn open_read_write_pool(&self, path: &Path) -> Result<SqlitePool, Error> {
         let options = SqliteConnectOptions::new()
@@ -303,3 +370,24 @@ impl SqliteConfig {
             .await
     }
 }
+
+fn sqlite_error_is_lock(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| {
+        let Some(sqlx_error) = source.downcast_ref::<sqlx::Error>() else {
+            return false;
+        };
+        let sqlx::Error::Database(database_error) = sqlx_error else {
+            return false;
+        };
+        database_error.code().is_some_and(|code| {
+            matches!(
+                code.as_ref().to_ascii_lowercase().as_str(),
+                "5" | "6" | "sqlite_busy" | "sqlite_locked"
+            )
+        }) || crate::runtime::sqlite_error_detail_is_lock(database_error.message())
+    })
+}
+
+#[cfg(test)]
+#[path = "sqlite_tests.rs"]
+mod tests;
