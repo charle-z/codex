@@ -24,6 +24,7 @@ use crate::schema::SubagentStartCommandInput;
 pub enum SessionStartSource {
     Startup,
     Resume,
+    Fork,
     Clear,
     Compact,
 }
@@ -33,6 +34,7 @@ impl SessionStartSource {
         match self {
             Self::Startup => "startup",
             Self::Resume => "resume",
+            Self::Fork => "fork",
             Self::Clear => "clear",
             Self::Compact => "compact",
         }
@@ -362,11 +364,21 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::SessionStartHandlerData;
+    use super::SessionStartSource;
     use super::parse_completed;
     use crate::engine::ConfiguredHandler;
     use crate::engine::HandlerRunResult;
     use crate::output_spill::AdditionalContext;
     use crate::output_spill::AdditionalContextLimit;
+
+    #[test]
+    fn session_start_source_strings_are_stable() {
+        assert_eq!(SessionStartSource::Startup.as_str(), "startup");
+        assert_eq!(SessionStartSource::Resume.as_str(), "resume");
+        assert_eq!(SessionStartSource::Fork.as_str(), "fork");
+        assert_eq!(SessionStartSource::Clear.as_str(), "clear");
+        assert_eq!(SessionStartSource::Compact.as_str(), "compact");
+    }
 
     #[test]
     fn plain_stdout_becomes_model_context() {
