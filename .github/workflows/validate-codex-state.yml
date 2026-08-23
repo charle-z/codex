@@ -33,3 +33,17 @@ jobs:
         run: just fmt
       - name: Verify validation did not change tracked files
         run: git diff --exit-code
+
+  baseline-format:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 99660ab3c7b861c916e467581fa9b8723504d66b
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+      - name: Run repository formatter on exact upstream base
+        run: just fmt
