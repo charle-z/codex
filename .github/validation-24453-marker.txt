@@ -1,1 +1,2 @@
 Validation-only marker for openai/codex#24453. No source changes.
+Rerun after relaxing the wrapper exit-code assertion; execution marker is authoritative.
