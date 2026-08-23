@@ -1,0 +1,72 @@
+name: validate-39951-fork-source
+
+on:
+  pull_request:
+    branches:
+      - validation/base-39951-focal
+
+permissions:
+  contents: write
+
+jobs:
+  focal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source
+          persist-credentials: true
+
+      - name: Apply exact fork source mapping
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('codex-rs/core/src/session/session.rs')
+          text = path.read_text()
+
+          impl_marker = '''\nimpl Session {\n    /// Returns the concrete identity for this thread.'''
+          helper = '''\nfn session_start_source_for_initial_history(\n    initial_history: &InitialHistory,\n) -> codex_hooks::SessionStartSource {\n    match initial_history {\n        InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,\n        InitialHistory::Forked(_) => codex_hooks::SessionStartSource::Fork,\n        InitialHistory::New => codex_hooks::SessionStartSource::Startup,\n        InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,\n    }\n}\n\nimpl Session {\n    /// Returns the concrete identity for this thread.'''
+          if text.count(impl_marker) != 1:
+              raise SystemExit(f'expected one Session impl marker, found {text.count(impl_marker)}')
+          text = text.replace(impl_marker, helper, 1)
+
+          old_mapping = '''            let session_start_source = match &initial_history {\n                InitialHistory::Resumed(_) => codex_hooks::SessionStartSource::Resume,\n                InitialHistory::New | InitialHistory::Forked(_) => {\n                    codex_hooks::SessionStartSource::Startup\n                }\n                InitialHistory::Cleared => codex_hooks::SessionStartSource::Clear,\n            };'''
+          new_mapping = '''            let session_start_source =\n                session_start_source_for_initial_history(&initial_history);'''
+          if text.count(old_mapping) != 1:
+              raise SystemExit(f'expected one SessionStart mapping block, found {text.count(old_mapping)}')
+          text = text.replace(old_mapping, new_mapping, 1)
+
+          test_module = '''\n\n#[cfg(test)]\nmod session_start_source_tests {\n    use super::*;\n\n    #[test]\n    fn forked_initial_history_uses_fork_session_start_source() {\n        let source = session_start_source_for_initial_history(&InitialHistory::Forked(Vec::new()));\n\n        assert_eq!(source.as_str(), "fork");\n    }\n}\n'''
+          if 'fn forked_initial_history_uses_fork_session_start_source()' in text:
+              raise SystemExit('fork source regression test already exists unexpectedly')
+          text = text.rstrip() + test_module
+          path.write_text(text)
+          PY
+
+          cargo fmt --all
+          git diff --check
+          test "$(git diff --name-only | wc -l)" -eq 1
+          test "$(git diff --name-only)" = "codex-rs/core/src/session/session.rs"
+
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+
+      - name: Test hook source contract
+        working-directory: codex-rs
+        run: just test -p codex-hooks session_start_source_strings_are_stable -- --nocapture
+
+      - name: Test fork history mapping
+        working-directory: codex-rs
+        run: just test -p codex-core forked_initial_history_uses_fork_session_start_source -- --nocapture
+
+      - name: Commit validated core mapping
+        shell: bash
+        run: |
+          git config user.name "Carlos Acosta"
+          git config user.email "93443910+charle-z@users.noreply.github.com"
+          git add codex-rs/core/src/session/session.rs
+          git commit -m "fix(core): classify fork session start source"
+          git push origin HEAD:fix/39951-session-start-fork-source
