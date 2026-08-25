@@ -1,0 +1,37 @@
+name: validate-state-candidate
+
+on:
+  push:
+    branches:
+      - "ci/35555-v3-public-runner"
+
+permissions:
+  contents: read
+
+jobs:
+  codex-state:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: codex-rs
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 94a4bdb297a051d2f42daa8ec2a0f90ce1a9ff02
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: clippy
+      - name: Install Linux build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update -y
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev
+      - name: Clippy codex-state
+        run: cargo clippy -p codex-state --tests -- -D warnings
+      - name: Test codex-state serially
+        env:
+          RUST_MIN_STACK: "8388608"
+        run: cargo test -p codex-state -- --test-threads=1
