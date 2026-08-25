@@ -69,6 +69,7 @@ pub use recovery::RuntimeDbBackup;
 pub(super) use recovery::RuntimeDbInitError;
 pub use recovery::backup_runtime_db_for_fresh_start;
 pub use recovery::is_sqlite_corruption_error;
+use recovery::is_sqlite_lock_error;
 pub use recovery::runtime_db_path_for_corruption_error;
 pub use recovery::sqlite_error_detail_is_corruption;
 pub use recovery::sqlite_error_detail_is_lock;
@@ -89,7 +90,7 @@ pub struct StateRuntime {
     sqlite: SqliteConfig,
     default_provider: String,
     pool: Arc<sqlx::SqlitePool>,
-    logs_pool: Arc<sqlx::SqlitePool>,
+    logs_pool: Option<Arc<sqlx::SqlitePool>>,
     thread_goals: GoalStore,
     memories: MemoryStore,
     thread_queue: SqliteQueueStore,
@@ -147,7 +148,19 @@ impl StateRuntime {
             .open_logs_db(&logs_migrator, telemetry_override)
             .await
         {
-            Ok(db) => Arc::new(db),
+            Ok(db) => Some(Arc::new(db)),
+            Err(err) if is_sqlite_lock_error(&err) => {
+                warn!(
+                    "logs db at {} is locked; continuing without persistent log storage: {err}",
+                    logs_path.display()
+                );
+                crate::telemetry::record_fallback(
+                    "state_runtime_init",
+                    "logs_db_locked",
+                    telemetry_override,
+                );
+                None
+            }
             Err(err) => {
                 warn!("failed to open logs db at {}: {err}", logs_path.display());
                 close_sqlite_pools(&[pool.as_ref()]).await;
@@ -161,7 +174,7 @@ impl StateRuntime {
             Ok(db) => Arc::new(db),
             Err(err) => {
                 warn!("failed to open goals db at {}: {err}", goals_path.display());
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref()]).await;
+                close_sqlite_pools_with_optional_logs(&[pool.as_ref()], logs_pool.as_deref()).await;
                 return Err(err);
             }
         };
@@ -175,7 +188,11 @@ impl StateRuntime {
                     "failed to open memories db at {}: {err}",
                     memories_path.display()
                 );
-                close_sqlite_pools(&[pool.as_ref(), logs_pool.as_ref(), goals_pool.as_ref()]).await;
+                close_sqlite_pools_with_optional_logs(
+                    &[pool.as_ref(), goals_pool.as_ref()],
+                    logs_pool.as_deref(),
+                )
+                .await;
                 return Err(err);
             }
         };
@@ -186,12 +203,10 @@ impl StateRuntime {
             Ok(db) => Arc::new(db),
             Err(err) => {
                 warn!("failed to open queue db at {}: {err}", queue_path.display());
-                close_sqlite_pools(&[
-                    pool.as_ref(),
-                    logs_pool.as_ref(),
-                    goals_pool.as_ref(),
-                    memories_pool.as_ref(),
-                ])
+                close_sqlite_pools_with_optional_logs(
+                    &[pool.as_ref(), goals_pool.as_ref(), memories_pool.as_ref()],
+                    logs_pool.as_deref(),
+                )
                 .await;
                 return Err(err);
             }
@@ -206,13 +221,15 @@ impl StateRuntime {
             &backfill_state_result,
         );
         if let Err(err) = backfill_state_result {
-            close_sqlite_pools(&[
-                pool.as_ref(),
-                logs_pool.as_ref(),
-                goals_pool.as_ref(),
-                memories_pool.as_ref(),
-                queue_pool.as_ref(),
-            ])
+            close_sqlite_pools_with_optional_logs(
+                &[
+                    pool.as_ref(),
+                    goals_pool.as_ref(),
+                    memories_pool.as_ref(),
+                    queue_pool.as_ref(),
+                ],
+                logs_pool.as_deref(),
+            )
             .await;
             return Err(err);
         }
@@ -235,13 +252,15 @@ impl StateRuntime {
             match thread_timestamp_millis_result {
                 Ok(value) => value,
                 Err(err) => {
-                    close_sqlite_pools(&[
-                        pool.as_ref(),
-                        logs_pool.as_ref(),
-                        goals_pool.as_ref(),
-                        memories_pool.as_ref(),
-                        queue_pool.as_ref(),
-                    ])
+                    close_sqlite_pools_with_optional_logs(
+                        &[
+                            pool.as_ref(),
+                            goals_pool.as_ref(),
+                            memories_pool.as_ref(),
+                            queue_pool.as_ref(),
+                        ],
+                        logs_pool.as_deref(),
+                    )
                     .await;
                     return Err(err);
                 }
@@ -259,7 +278,9 @@ impl StateRuntime {
             thread_updated_at_millis: Arc::new(AtomicI64::new(thread_updated_at_millis)),
             thread_recency_at_millis: Arc::new(AtomicI64::new(thread_recency_at_millis)),
         });
-        if let Err(err) = runtime.run_logs_startup_maintenance().await {
+        if runtime.logs_pool.is_some()
+            && let Err(err) = runtime.run_logs_startup_maintenance().await
+        {
             warn!(
                 "failed to run startup maintenance for logs db at {}: {err}",
                 logs_path.display(),
@@ -286,12 +307,28 @@ impl StateRuntime {
         &self.thread_queue
     }
 
+    /// Verify that strict thread deletion can reach every persistent state store.
+    pub fn ensure_strict_thread_delete_available(&self) -> anyhow::Result<()> {
+        self.logs_pool().map(|_| ())
+    }
+
+    fn logs_pool(&self) -> anyhow::Result<&SqlitePool> {
+        self.logs_pool.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "persistent log store at {} is unavailable because it was locked during startup; restart Codex after the lock is released",
+                self.sqlite.logs_db_path().display()
+            )
+        })
+    }
+
     /// Close all SQLite pools and wait for outstanding pool workers to exit.
     pub async fn close(&self) {
         self.thread_queue.close().await;
         self.memories.close().await;
         self.thread_goals.close().await;
-        self.logs_pool.close().await;
+        if let Some(logs_pool) = self.logs_pool.as_ref() {
+            logs_pool.close().await;
+        }
         self.pool.close().await;
     }
 
@@ -314,6 +351,16 @@ impl StateRuntime {
 async fn close_sqlite_pools(pools: &[&SqlitePool]) {
     for pool in pools {
         pool.close().await;
+    }
+}
+
+async fn close_sqlite_pools_with_optional_logs(
+    pools: &[&SqlitePool],
+    logs_pool: Option<&SqlitePool>,
+) {
+    close_sqlite_pools(pools).await;
+    if let Some(logs_pool) = logs_pool {
+        logs_pool.close().await;
     }
 }
 
@@ -426,14 +473,18 @@ mod tests {
     use super::sqlite_integrity_check;
     use super::test_support::test_thread_metadata;
     use super::test_support::unique_temp_dir;
+    use crate::DB_FALLBACK_METRIC;
     use crate::DB_INIT_METRIC;
     use crate::DbTelemetry;
+    use crate::LogQuery;
     use crate::migrations::STATE_MIGRATOR;
     use codex_protocol::ThreadId;
     use codex_utils_absolute_path::test_support::PathExt;
     use pretty_assertions::assert_eq;
+    use sqlx::Sqlite;
     use sqlx::SqlitePool;
     use sqlx::migrate::MigrateError;
+    use sqlx::pool::PoolConnection;
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::path::Path;
@@ -498,6 +549,38 @@ mod tests {
             .open_read_write_pool(path)
             .await
             .expect("open sqlite pool")
+    }
+
+    async fn hold_logs_write_lock(
+        sqlite: &crate::SqliteConfig,
+    ) -> (SqlitePool, PoolConnection<Sqlite>) {
+        let pool = sqlite
+            .open_read_write_pool(sqlite.logs_db_path().as_path())
+            .await
+            .expect("open logs lock-holder pool");
+        sqlx::query("CREATE TABLE lock_holder (value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create logs lock-holder table");
+        let mut blocker = pool.acquire().await.expect("acquire logs lock holder");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .expect("hold logs database write lock");
+        sqlx::query("INSERT INTO lock_holder (value) VALUES (1)")
+            .execute(&mut *blocker)
+            .await
+            .expect("keep logs write transaction active");
+        (pool, blocker)
+    }
+
+    async fn release_logs_write_lock(mut blocker: PoolConnection<Sqlite>, pool: SqlitePool) {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *blocker)
+            .await
+            .expect("release logs database write lock");
+        drop(blocker);
+        pool.close().await;
     }
 
     #[tokio::test]
@@ -674,6 +757,171 @@ mod tests {
         assert_eq!(phases, expected);
 
         runtime.close().await;
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn transient_logs_lock_recovers_without_degradation() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let telemetry = TestTelemetry::default();
+        let (blocker_pool, blocker) = hold_logs_write_lock(&sqlite).await;
+
+        let init = StateRuntime::init_with_telemetry_for_tests(
+            sqlite.clone(),
+            "test-provider".to_string(),
+            &telemetry,
+        );
+        let release = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            release_logs_write_lock(blocker, blocker_pool).await;
+        };
+        let (runtime, ()) = tokio::join!(init, release);
+        let runtime = runtime.expect("transient logs lock should clear within the busy timeout");
+
+        runtime
+            .query_logs(&LogQuery::default())
+            .await
+            .expect("transient lock should preserve persistent log storage");
+        assert!(
+            !telemetry.counters().iter().any(|event| {
+                event.name == DB_FALLBACK_METRIC
+                    && event.tags.get("caller").map(String::as_str) == Some("state_runtime_init")
+            }),
+            "transient logs lock should not enter degraded mode"
+        );
+
+        runtime.close().await;
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn locked_logs_db_does_not_gate_state_but_blocks_strict_thread_delete() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let telemetry = TestTelemetry::default();
+        let (blocker_pool, blocker) = hold_logs_write_lock(&sqlite).await;
+
+        let runtime = StateRuntime::init_with_telemetry_for_tests(
+            sqlite.clone(),
+            "test-provider".to_string(),
+            &telemetry,
+        )
+        .await
+        .expect("locked logs db should not gate state runtime initialization");
+        runtime
+            .ensure_strict_thread_delete_available()
+            .expect_err("strict thread deletion should preflight the persistent log store");
+
+        let log_err = runtime
+            .query_logs(&LogQuery::default())
+            .await
+            .expect_err("degraded runtime should report unavailable persistent logs");
+        assert!(
+            log_err.to_string().contains("log store"),
+            "unexpected degraded log error: {log_err:#}"
+        );
+
+        let thread_id =
+            ThreadId::from_string("00000000-0000-0000-0000-000000000355").expect("valid thread id");
+        runtime
+            .upsert_thread(&test_thread_metadata(
+                &codex_home,
+                thread_id,
+                codex_home.clone(),
+            ))
+            .await
+            .expect("core thread state should remain writable while logs are degraded");
+        runtime
+            .thread_goals()
+            .replace_thread_goal(
+                thread_id,
+                "preserve me",
+                crate::ThreadGoalStatus::Active,
+                /*token_budget*/ None,
+            )
+            .await
+            .expect("thread goal should be stored before failed strict deletion");
+
+        let delete_err = runtime
+            .delete_thread(thread_id)
+            .await
+            .expect_err("strict deletion must not succeed without the persistent log store");
+        assert!(
+            delete_err.to_string().contains("log store"),
+            "unexpected strict deletion error: {delete_err:#}"
+        );
+        assert!(
+            runtime
+                .get_thread(thread_id)
+                .await
+                .expect("read thread after failed strict deletion")
+                .is_some(),
+            "failed strict deletion must leave core thread state intact"
+        );
+        assert!(
+            runtime
+                .thread_goals()
+                .get_thread_goal(thread_id)
+                .await
+                .expect("read thread goal after failed strict deletion")
+                .is_some(),
+            "failed strict deletion must leave associated state intact"
+        );
+
+        assert!(
+            telemetry.counters().iter().any(|event| {
+                event.name == DB_FALLBACK_METRIC
+                    && event.tags.get("caller").map(String::as_str) == Some("state_runtime_init")
+                    && event.tags.get("reason").map(String::as_str) == Some("logs_db_locked")
+            }),
+            "degraded logs startup should emit fallback telemetry"
+        );
+
+        release_logs_write_lock(blocker, blocker_pool).await;
+        runtime
+            .query_logs(&LogQuery::default())
+            .await
+            .expect_err("degraded runtime should require a restart after the lock is released");
+
+        runtime.close().await;
+        let recovered = StateRuntime::init(sqlite, "test-provider".to_string())
+            .await
+            .expect("persistent log store should recover after restart");
+        recovered
+            .query_logs(&LogQuery::default())
+            .await
+            .expect("persistent log store should be queryable after restart");
+        recovered.close().await;
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn corrupt_logs_db_remains_fatal_for_existing_recovery() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        tokio::fs::write(sqlite.logs_db_path(), b"not a sqlite database")
+            .await
+            .expect("write corrupt logs db");
+
+        let err = match StateRuntime::init(sqlite, "test-provider".to_string()).await {
+            Ok(_) => panic!("corrupt logs db should stay on the recovery path"),
+            Err(err) => err,
+        };
+        assert!(
+            super::is_sqlite_corruption_error(&err),
+            "corrupt logs db should remain classified as corruption: {err:#}"
+        );
+
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
