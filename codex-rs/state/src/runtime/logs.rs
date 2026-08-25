@@ -13,7 +13,7 @@ impl StateRuntime {
             return Ok(());
         }
 
-        let mut tx = self.logs_pool.begin().await?;
+        let mut tx = self.logs_pool()?.begin().await?;
         let mut builder = QueryBuilder::<Sqlite>::new(
             "INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id, process_uuid, module_path, file, line, estimated_bytes) ",
         );
@@ -288,7 +288,7 @@ WHERE id IN (
     pub(crate) async fn delete_logs_before(&self, cutoff_ts: i64) -> anyhow::Result<u64> {
         let result = sqlx::query("DELETE FROM logs WHERE ts < ?")
             .bind(cutoff_ts)
-            .execute(self.logs_pool.as_ref())
+            .execute(self.logs_pool()?)
             .await?;
         Ok(result.rows_affected())
     }
@@ -304,7 +304,7 @@ WHERE id IN (
         // PASSIVE checkpoints copy whatever is immediately available and skip
         // frames that would require waiting on active readers or writers.
         sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-            .execute(self.logs_pool.as_ref())
+            .execute(self.logs_pool()?)
             .await?;
         Ok(())
     }
@@ -326,7 +326,7 @@ WHERE id IN (
 
         let rows = builder
             .build_query_as::<LogRow>()
-            .fetch_all(self.logs_pool.as_ref())
+            .fetch_all(self.logs_pool()?)
             .await?;
         Ok(rows)
     }
@@ -407,7 +407,7 @@ WHERE cumulative_estimated_bytes <=
         builder.push(" ORDER BY ts DESC, ts_nanos DESC, id DESC");
         let rows = builder
             .build_query_as::<FeedbackLogRow>()
-            .fetch_all(self.logs_pool.as_ref())
+            .fetch_all(self.logs_pool()?)
             .await?;
 
         let mut lines = Vec::new();
@@ -440,7 +440,7 @@ WHERE cumulative_estimated_bytes <=
         let mut builder =
             QueryBuilder::<Sqlite>::new("SELECT MAX(id) AS max_id FROM logs WHERE 1 = 1");
         push_log_filters(&mut builder, query);
-        let row = builder.build().fetch_one(self.logs_pool.as_ref()).await?;
+        let row = builder.build().fetch_one(self.logs_pool()?).await?;
         let max_id: Option<i64> = row.try_get("max_id")?;
         Ok(max_id.unwrap_or(0))
     }
