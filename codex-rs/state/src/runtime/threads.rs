@@ -1118,6 +1118,8 @@ ON CONFLICT(id) DO UPDATE SET
         if thread_ids.is_empty() {
             return Ok(0);
         }
+        self.ensure_strict_thread_delete_available()?;
+        let logs_pool = self.logs_pool()?;
 
         let thread_id_strings = thread_ids
             .iter()
@@ -1126,7 +1128,7 @@ ON CONFLICT(id) DO UPDATE SET
         for (thread_id, thread_id_string) in thread_ids.iter().zip(&thread_id_strings) {
             sqlx::query("DELETE FROM logs WHERE thread_id = ?")
                 .bind(thread_id_string)
-                .execute(self.logs_pool.as_ref())
+                .execute(logs_pool)
                 .await?;
             self.thread_queue.delete_thread_queue(*thread_id).await?;
             self.memories.delete_thread_memory(*thread_id).await?;
@@ -1959,7 +1961,12 @@ mod tests {
             .await?;
         seed_thread_cleanup_state(&runtime, thread_id, child_thread_id).await?;
 
-        runtime.logs_pool.close().await;
+        runtime
+            .logs_pool
+            .as_ref()
+            .expect("logs db should be available")
+            .close()
+            .await;
         runtime
             .delete_thread(thread_id)
             .await
@@ -1996,7 +2003,12 @@ mod tests {
             .await?;
         sqlx::query("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) VALUES (1, 0, 'INFO', 'test', 'feedback log', ?)")
             .bind(thread_id.to_string())
-            .execute(runtime.logs_pool.as_ref())
+            .execute(
+                runtime
+                    .logs_pool
+                    .as_deref()
+                    .expect("logs db should be available"),
+            )
             .await?;
         Ok(())
     }
