@@ -871,6 +871,7 @@ mod tests {
         let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
         let telemetry = TestTelemetry::default();
         let (blocker_pool, blocker) = hold_logs_write_lock(&sqlite).await;
+        let started = Instant::now();
 
         let runtime = StateRuntime::init_with_telemetry_for_tests(
             sqlite.clone(),
@@ -879,6 +880,12 @@ mod tests {
         )
         .await
         .expect("locked logs db should not gate state runtime initialization");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(10),
+            "logs lock should honor the bounded busy timeout before degradation: {elapsed:?}"
+        );
+
         runtime
             .ensure_strict_thread_delete_available()
             .expect_err("strict thread deletion should preflight the persistent log store");
