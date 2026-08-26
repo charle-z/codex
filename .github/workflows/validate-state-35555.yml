@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: 0bc3a2ac47372392370e240a223adc32c888ff30
+          ref: 711f352d8be57e62f0ab66ab273de4e31359995c
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
