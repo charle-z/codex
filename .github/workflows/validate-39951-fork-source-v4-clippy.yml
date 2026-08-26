@@ -1,0 +1,103 @@
+name: validate-39951-fork-source-v4-clippy
+
+on:
+  pull_request:
+    branches:
+      - validation/base-39951-fork-source-v4-clippy
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  clippy-final:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: validation/base-39951-fork-source-v4-clippy
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Assert exact current upstream base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "7f823973633472ec75b9ab86342e01561f78dd42"
+          git diff --quiet HEAD^ -- codex-rs
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.103
+
+      - name: Checkout exact source candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source-v4
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Assert candidate identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "a45c7e7539018e428126c895fe34f14bc69d75ea"
+          test "$(git rev-parse HEAD^)" = "7f823973633472ec75b9ab86342e01561f78dd42"
+          git diff --check HEAD^..HEAD
+
+      - name: Run clippy with current-main baseline warning isolated
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline=core/tests/suite/openai_file_mcp.rs
+          grep -q '^use wiremock::matchers::body_json;$' "$baseline"
+          sed -i '/^use wiremock::matchers::body_json;$/d' "$baseline"
+          cargo clippy -p codex-hooks --all-targets -- -D warnings
+          cargo clippy -p codex-core --tests -- -D warnings
+          git restore --source=HEAD -- "$baseline"
+          cd ..
+          git diff --check
+          git diff --exit-code
+
+      - name: Final format schema and focal recheck
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          just write-hooks-schema
+          git diff --exit-code
+          just test -p codex-hooks generated_hook_schemas_match_fixtures
+          just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+
+      - name: Verify exact final source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check 7f823973633472ec75b9ab86342e01561f78dd42..HEAD
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/schema/generated/session-start.command.input.schema.json",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          actual = set(subprocess.check_output([
+              "git", "diff", "--name-only",
+              "7f823973633472ec75b9ab86342e01561f78dd42..HEAD"
+          ], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f"unexpected final diff: {sorted(actual)}")
+          PY
+          test -z "$(git status --porcelain)"
+          git diff --stat 7f823973633472ec75b9ab86342e01561f78dd42..HEAD
