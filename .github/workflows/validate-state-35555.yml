@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: 711f352d8be57e62f0ab66ab273de4e31359995c
+          ref: 680038025ccec05808d11c37fa1a8de41a2ca8a0
           persist-credentials: false
       - uses: ./.github/actions/setup-ci
       - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
@@ -29,6 +29,12 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential pkg-config libcap-dev
+      - name: Fix codex-state
+        run: cargo clippy --fix --tests --allow-dirty -p codex-state
+      - name: Format Rust
+        run: cargo fmt -- --config imports_granularity=Item
+      - name: Verify fix and format are clean
+        run: git diff --exit-code
       - name: Check codex-app-server library
         run: cargo check -p codex-app-server --lib
       - name: Clippy codex-state
