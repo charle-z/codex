@@ -1,0 +1,489 @@
+name: validate-39951-fork-source-v4
+
+on:
+  pull_request:
+    branches:
+      - validation/base-39951-fork-source-v4
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  focal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: validation/base-39951-fork-source-v4
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Assert exact current upstream code base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "7f823973633472ec75b9ab86342e01561f78dd42"
+          git diff --quiet HEAD^ -- codex-rs
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.103
+
+      - name: Instrument current-main fork reproduction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("codex-rs/core/tests/suite/hooks.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one anchor, found {count}")
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              "use codex_core::StartThreadOptions;\nuse codex_core::TurnInputRequest;",
+              "use codex_core::ForkSnapshot;\nuse codex_core::StartThreadOptions;\nuse codex_core::TurnInputRequest;",
+          )
+
+          helper_anchor = "fn write_session_start_hooks_with_individual_context_limits("
+          helper = r'''fn write_fork_repro_session_start_hook(
+              home: &Path,
+              matcher: &str,
+              additional_context: &str,
+          ) -> Result<()> {
+              let script_path = home.join("session_start_hook.py");
+              let log_path = home.join("session_start_hook_log.jsonl");
+              let additional_context_json = serde_json::to_string(additional_context)
+                  .context("serialize fork repro session start context")?;
+              let script = format!(
+                  r#"import json
+          from pathlib import Path
+          import sys
+
+          payload = json.load(sys.stdin)
+          with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
+              handle.write(json.dumps(payload) + "\n")
+          print(json.dumps({{
+              "hookSpecificOutput": {{
+                  "hookEventName": "SessionStart",
+                  "additionalContext": {additional_context_json}
+              }}
+          }}))
+          "#,
+                  log_path = log_path.display(),
+              );
+              let hooks = serde_json::json!({
+                  "hooks": {
+                      "SessionStart": [{
+                          "matcher": matcher,
+                          "hooks": [{
+                              "type": "command",
+                              "command": format!("python3 {}", script_path.display()),
+                              "statusMessage": "running fork repro session start hook",
+                          }]
+                      }]
+                  }
+              });
+
+              fs::write(&script_path, script).context("write fork repro session start hook")?;
+              fs::write(home.join("hooks.json"), hooks.to_string())
+                  .context("write fork repro hooks.json")?;
+              Ok(())
+          }
+
+          '''
+          replace_once(helper_anchor, helper + helper_anchor)
+
+          test_anchor = "#[tokio::test]\nasync fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {"
+          baseline_test = r'''#[tokio::test]
+          async fn current_main_fork_replays_and_duplicates_session_start_for_startup_and_wildcard()
+          -> Result<()> {
+              skip_if_no_network!(Ok(()));
+
+              for matcher in ["startup", "*"] {
+                  let server = start_mock_server().await;
+                  let responses = mount_sse_sequence(
+                      &server,
+                      vec![
+                          sse(vec![
+                              ev_response_created("resp-parent-repro"),
+                              ev_assistant_message("msg-parent-repro", "parent turn complete"),
+                              ev_completed("resp-parent-repro"),
+                          ]),
+                          sse(vec![
+                              ev_response_created("resp-fork-repro"),
+                              ev_assistant_message("msg-fork-repro", "fork turn complete"),
+                              ev_completed("resp-fork-repro"),
+                          ]),
+                      ],
+                  )
+                  .await;
+                  let context = format!("fork-repro-context-{matcher}");
+                  let hook_context = context.clone();
+                  let matcher_owned = matcher.to_string();
+                  let mut builder = test_codex()
+                      .with_pre_build_hook(move |home| {
+                          write_fork_repro_session_start_hook(
+                              home,
+                              &matcher_owned,
+                              &hook_context,
+                          )
+                          .expect("failed to write fork repro hook");
+                      })
+                      .with_config(trust_discovered_hooks);
+                  let test = builder.build(&server).await?;
+
+                  test.submit_turn("parent prompt").await?;
+                  test.codex.flush_rollout().await?;
+                  let rollout_path = test.codex.rollout_path().expect("parent rollout path");
+                  let forked = test
+                      .thread_manager
+                      .fork_thread(
+                          ForkSnapshot::Interrupted,
+                          test.config.clone(),
+                          rollout_path,
+                          /*thread_source*/ None,
+                          /*parent_trace*/ None,
+                      )
+                      .await?
+                      .thread;
+
+                  forked
+                      .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                          text: "fork prompt".to_string(),
+                          text_elements: Vec::new(),
+                      }]))
+                      .await?;
+                  wait_for_event(&forked, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+                  let sources = read_session_start_hook_inputs(test.codex_home_path())?
+                      .into_iter()
+                      .map(|input| {
+                          input["source"]
+                              .as_str()
+                              .expect("SessionStart source")
+                              .to_string()
+                      })
+                      .collect::<Vec<_>>();
+                  assert_eq!(sources, vec!["startup", "startup"], "matcher {matcher}");
+
+                  let requests = responses.requests();
+                  assert_eq!(requests.len(), 2, "matcher {matcher}");
+                  let parent_count = requests[0]
+                      .message_input_texts("developer")
+                      .iter()
+                      .filter(|message| message.as_str() == context.as_str())
+                      .count();
+                  let fork_count = requests[1]
+                      .message_input_texts("developer")
+                      .iter()
+                      .filter(|message| message.as_str() == context.as_str())
+                      .count();
+                  assert_eq!(parent_count, 1, "matcher {matcher}");
+                  assert_eq!(fork_count, 2, "matcher {matcher}");
+
+                  forked.shutdown_and_wait().await?;
+              }
+
+              Ok(())
+          }
+
+          '''
+          replace_once(test_anchor, baseline_test + test_anchor)
+          path.write_text(text)
+          PY
+          cargo fmt --manifest-path codex-rs/Cargo.toml --all
+          git diff --check
+
+      - name: Reproduce current-main duplication
+        working-directory: codex-rs
+        run: just test -p codex-core current_main_fork_replays_and_duplicates_session_start_for_startup_and_wildcard
+
+      - name: Checkout exact rebased source candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source-v4
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Assert exact candidate head and base
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "a45c7e7539018e428126c895fe34f14bc69d75ea"
+          test "$(git rev-parse HEAD^)" = "7f823973633472ec75b9ab86342e01561f78dd42"
+          git diff --check HEAD^..HEAD
+
+      - name: Regenerate schema and check formatting
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          just write-hooks-schema
+          cargo fmt --all -- --check
+          grep -q '"fork"' hooks/schema/generated/session-start.command.input.schema.json
+          git diff --exit-code
+
+      - name: Test generated hook contract
+        working-directory: codex-rs
+        run: just test -p codex-hooks generated_hook_schemas_match_fixtures
+
+      - name: Test real fork SessionStart behavior
+        working-directory: codex-rs
+        run: just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+
+      - name: Test hooks crate
+        working-directory: codex-rs
+        run: just test -p codex-hooks
+
+      - name: Instrument patched matcher/context distinction
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("codex-rs/core/tests/suite/hooks.rs")
+          text = path.read_text()
+
+          def replace_once(old: str, new: str) -> None:
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"expected exactly one anchor, found {count}")
+              text = text.replace(old, new, 1)
+
+          helper_anchor = "fn write_session_start_hooks_with_individual_context_limits("
+          helper = r'''fn write_fork_repro_session_start_hook(
+              home: &Path,
+              matcher: &str,
+              additional_context: &str,
+          ) -> Result<()> {
+              let script_path = home.join("session_start_hook.py");
+              let log_path = home.join("session_start_hook_log.jsonl");
+              let additional_context_json = serde_json::to_string(additional_context)
+                  .context("serialize fork repro session start context")?;
+              let script = format!(
+                  r#"import json
+          from pathlib import Path
+          import sys
+
+          payload = json.load(sys.stdin)
+          with Path(r"{log_path}").open("a", encoding="utf-8") as handle:
+              handle.write(json.dumps(payload) + "\n")
+          print(json.dumps({{
+              "hookSpecificOutput": {{
+                  "hookEventName": "SessionStart",
+                  "additionalContext": {additional_context_json}
+              }}
+          }}))
+          "#,
+                  log_path = log_path.display(),
+              );
+              let hooks = serde_json::json!({
+                  "hooks": {
+                      "SessionStart": [{
+                          "matcher": matcher,
+                          "hooks": [{
+                              "type": "command",
+                              "command": format!("python3 {}", script_path.display()),
+                              "statusMessage": "running fork repro session start hook",
+                          }]
+                      }]
+                  }
+              });
+
+              fs::write(&script_path, script).context("write fork repro session start hook")?;
+              fs::write(home.join("hooks.json"), hooks.to_string())
+                  .context("write fork repro hooks.json")?;
+              Ok(())
+          }
+
+          '''
+          replace_once(helper_anchor, helper + helper_anchor)
+
+          test_anchor = "#[tokio::test]\nasync fn async_hook_context_is_injected_into_the_active_turn() -> Result<()> {"
+          patched_test = r'''#[tokio::test]
+          async fn fork_source_separates_startup_matcher_but_wildcard_still_runs() -> Result<()> {
+              skip_if_no_network!(Ok(()));
+
+              for matcher in ["startup", "*"] {
+                  let server = start_mock_server().await;
+                  let responses = mount_sse_sequence(
+                      &server,
+                      vec![
+                          sse(vec![
+                              ev_response_created("resp-parent-repro"),
+                              ev_assistant_message("msg-parent-repro", "parent turn complete"),
+                              ev_completed("resp-parent-repro"),
+                          ]),
+                          sse(vec![
+                              ev_response_created("resp-fork-repro"),
+                              ev_assistant_message("msg-fork-repro", "fork turn complete"),
+                              ev_completed("resp-fork-repro"),
+                          ]),
+                      ],
+                  )
+                  .await;
+                  let context = format!("fork-repro-context-{matcher}");
+                  let hook_context = context.clone();
+                  let matcher_owned = matcher.to_string();
+                  let mut builder = test_codex()
+                      .with_pre_build_hook(move |home| {
+                          write_fork_repro_session_start_hook(
+                              home,
+                              &matcher_owned,
+                              &hook_context,
+                          )
+                          .expect("failed to write fork repro hook");
+                      })
+                      .with_config(trust_discovered_hooks);
+                  let test = builder.build(&server).await?;
+
+                  test.submit_turn("parent prompt").await?;
+                  test.codex.flush_rollout().await?;
+                  let rollout_path = test.codex.rollout_path().expect("parent rollout path");
+                  let forked = test
+                      .thread_manager
+                      .fork_thread(
+                          ForkSnapshot::Interrupted,
+                          test.config.clone(),
+                          rollout_path,
+                          /*thread_source*/ None,
+                          /*parent_trace*/ None,
+                      )
+                      .await?
+                      .thread;
+
+                  forked
+                      .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+                          text: "fork prompt".to_string(),
+                          text_elements: Vec::new(),
+                      }]))
+                      .await?;
+                  wait_for_event(&forked, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+                  let sources = read_session_start_hook_inputs(test.codex_home_path())?
+                      .into_iter()
+                      .map(|input| {
+                          input["source"]
+                              .as_str()
+                              .expect("SessionStart source")
+                              .to_string()
+                      })
+                      .collect::<Vec<_>>();
+                  let expected_sources = if matcher == "startup" {
+                      vec!["startup"]
+                  } else {
+                      vec!["startup", "fork"]
+                  };
+                  assert_eq!(sources, expected_sources, "matcher {matcher}");
+
+                  let requests = responses.requests();
+                  assert_eq!(requests.len(), 2, "matcher {matcher}");
+                  let parent_count = requests[0]
+                      .message_input_texts("developer")
+                      .iter()
+                      .filter(|message| message.as_str() == context.as_str())
+                      .count();
+                  let fork_count = requests[1]
+                      .message_input_texts("developer")
+                      .iter()
+                      .filter(|message| message.as_str() == context.as_str())
+                      .count();
+                  assert_eq!(parent_count, 1, "matcher {matcher}");
+                  assert_eq!(fork_count, if matcher == "startup" { 1 } else { 2 }, "matcher {matcher}");
+
+                  forked.shutdown_and_wait().await?;
+              }
+
+              Ok(())
+          }
+
+          '''
+          replace_once(test_anchor, patched_test + test_anchor)
+          path.write_text(text)
+          PY
+          cargo fmt --manifest-path codex-rs/Cargo.toml --all
+          git diff --check
+
+      - name: Test patched startup versus wildcard behavior
+        working-directory: codex-rs
+        run: just test -p codex-core fork_source_separates_startup_matcher_but_wildcard_still_runs
+
+      - name: Restore temporary reproduction instrumentation
+        shell: bash
+        run: |
+          set -euo pipefail
+          git restore --source=HEAD -- codex-rs/core/tests/suite/hooks.rs
+          test -z "$(git status --porcelain)"
+
+      - name: Apply Rust fixes and require no candidate drift
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          just fix -p codex-hooks
+          just fix -p codex-core
+          cargo fmt --all
+          cd ..
+          if ! git diff --quiet -- codex-rs/core/tests/suite/openai_file_mcp.rs; then
+            git restore --source=HEAD -- codex-rs/core/tests/suite/openai_file_mcp.rs
+          fi
+          git diff --check
+          git diff --exit-code
+
+      - name: Clippy hooks and core tests
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy -p codex-hooks --all-targets -- -D warnings
+          cargo clippy -p codex-core --tests -- -D warnings
+
+      - name: Recheck focal tests after lint
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          just test -p codex-hooks generated_hook_schemas_match_fixtures
+          just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+
+      - name: Verify exact final source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check 7f823973633472ec75b9ab86342e01561f78dd42..HEAD
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/schema/generated/session-start.command.input.schema.json",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          actual = set(subprocess.check_output([
+              "git", "diff", "--name-only",
+              "7f823973633472ec75b9ab86342e01561f78dd42..HEAD"
+          ], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f"unexpected final diff: {sorted(actual)}")
+          PY
+          test -z "$(git status --porcelain)"
+          git diff --stat 7f823973633472ec75b9ab86342e01561f78dd42..HEAD
