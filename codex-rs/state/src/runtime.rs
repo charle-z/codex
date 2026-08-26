@@ -476,6 +476,7 @@ mod tests {
     use crate::DB_FALLBACK_METRIC;
     use crate::DB_INIT_METRIC;
     use crate::DbTelemetry;
+    use crate::LogEntry;
     use crate::LogQuery;
     use crate::migrations::STATE_MIGRATOR;
     use codex_protocol::ThreadId;
@@ -891,6 +892,24 @@ mod tests {
             "unexpected degraded log error: {log_err:#}"
         );
 
+        let log_write_err = runtime
+            .insert_logs(&[LogEntry {
+                ts: 1,
+                ts_nanos: 0,
+                level: "INFO".to_string(),
+                target: "degraded-test".to_string(),
+                message: Some("must not be dropped silently".to_string()),
+                feedback_log_body: None,
+                thread_id: None,
+                process_uuid: None,
+                module_path: None,
+                file: None,
+                line: None,
+            }])
+            .await
+            .expect_err("degraded runtime should reject persistent log writes explicitly");
+        assert!(log_write_err.to_string().contains("log store"));
+
         let thread_id =
             ThreadId::from_string("00000000-0000-0000-0000-000000000355").expect("valid thread id");
         runtime
@@ -911,6 +930,26 @@ mod tests {
             )
             .await
             .expect("thread goal should be stored before failed strict deletion");
+
+        runtime
+            .memories()
+            .clear_memory_data()
+            .await
+            .expect("memory store should remain writable while logs are degraded");
+        runtime
+            .thread_queue()
+            .enqueue(thread_id, r#"{"preserve":true}"#)
+            .await
+            .expect("thread queue should remain writable while logs are degraded");
+        assert_eq!(
+            1,
+            runtime
+                .thread_queue()
+                .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+                .await
+                .expect("thread queue should remain readable while logs are degraded")
+                .len()
+        );
 
         let delete_err = runtime
             .delete_thread(thread_id)
@@ -936,6 +975,17 @@ mod tests {
                 .expect("read thread goal after failed strict deletion")
                 .is_some(),
             "failed strict deletion must leave associated state intact"
+        );
+
+        assert_eq!(
+            1,
+            runtime
+                .thread_queue()
+                .list_page(thread_id, /*offset*/ 0, /*limit*/ 1)
+                .await
+                .expect("read queue after failed strict deletion")
+                .len(),
+            "failed strict deletion must leave queued state intact"
         );
 
         assert!(
