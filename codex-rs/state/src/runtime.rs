@@ -576,6 +576,29 @@ mod tests {
         (pool, blocker)
     }
 
+    async fn hold_state_write_lock(
+        sqlite: &crate::SqliteConfig,
+    ) -> (SqlitePool, PoolConnection<Sqlite>) {
+        let pool = sqlite
+            .open_read_write_pool(sqlite.state_db_path().as_path())
+            .await
+            .expect("open state lock-holder pool");
+        sqlx::query("CREATE TABLE state_lock_holder (value INTEGER NOT NULL)")
+            .execute(&pool)
+            .await
+            .expect("create state lock-holder table");
+        let mut blocker = pool.acquire().await.expect("acquire state lock holder");
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *blocker)
+            .await
+            .expect("hold state database write lock");
+        sqlx::query("INSERT INTO state_lock_holder (value) VALUES (1)")
+            .execute(&mut *blocker)
+            .await
+            .expect("keep state write transaction active");
+        (pool, blocker)
+    }
+
     async fn release_logs_write_lock(mut blocker: PoolConnection<Sqlite>, pool: SqlitePool) {
         sqlx::query("ROLLBACK")
             .execute(&mut *blocker)
@@ -797,6 +820,44 @@ mod tests {
         );
 
         runtime.close().await;
+        let _ = tokio::fs::remove_dir_all(codex_home).await;
+    }
+
+    #[tokio::test]
+    async fn locked_state_db_remains_startup_gating() {
+        let codex_home = unique_temp_dir();
+        tokio::fs::create_dir_all(&codex_home)
+            .await
+            .expect("create codex home");
+        let sqlite = crate::SqliteConfig::new_for_testing(codex_home.as_path().abs());
+        let (blocker_pool, blocker) = hold_state_write_lock(&sqlite).await;
+
+        let started = Instant::now();
+        let err = match StateRuntime::init(sqlite.clone(), "test-provider".to_string()).await {
+            Ok(_) => panic!("locked state db must remain startup-gating"),
+            Err(err) => err,
+        };
+        let elapsed = started.elapsed();
+        assert!(
+            super::is_sqlite_lock_error(&err),
+            "locked state db should remain a SQLite lock failure: {err:#}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(4) && elapsed < Duration::from_secs(10),
+            "state lock should honor the bounded busy timeout, elapsed: {elapsed:?}"
+        );
+        assert!(
+            !tokio::fs::try_exists(sqlite.logs_db_path())
+                .await
+                .expect("check logs db path"),
+            "state startup failure should happen before the logs db is opened"
+        );
+
+        release_logs_write_lock(blocker, blocker_pool).await;
+        let recovered = StateRuntime::init(sqlite, "test-provider".to_string())
+            .await
+            .expect("state runtime should recover after the state lock is released");
+        recovered.close().await;
         let _ = tokio::fs::remove_dir_all(codex_home).await;
     }
 
