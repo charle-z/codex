@@ -127,6 +127,7 @@ pub(crate) async fn run_pending_session_start_hooks(
                 if matches!(
                     session_start_source,
                     codex_hooks::SessionStartSource::Startup
+                        | codex_hooks::SessionStartSource::Fork
                 ) =>
             {
                 let context = subagent_hook_context(sess, agent_role);

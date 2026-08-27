@@ -542,8 +542,12 @@ async fn spawn_child_and_capture_snapshot(
         .await)
 }
 
+#[test_case(false; "fresh child")]
+#[test_case(true; "forked child")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn subagent_start_replaces_session_start_and_injects_context() -> Result<()> {
+async fn subagent_start_replaces_session_start_and_injects_context(
+    fork_context: bool,
+) -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
@@ -551,6 +555,7 @@ async fn subagent_start_replaces_session_start_and_injects_context() -> Result<(
         "message": CHILD_PROMPT,
         "task_name": "child",
         "agent_type": "worker",
+        "fork_context": fork_context,
     }))?;
 
     mount_sse_once_match(
