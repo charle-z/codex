@@ -1,0 +1,116 @@
+name: validate-39951-subagent-fork
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout current upstream snapshot
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: 7c3747941a6b664c30f1e6aa72a917fd74dc22d2
+          persist-credentials: false
+          fetch-depth: 2
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.103
+
+      - name: Turn existing SubagentStart test into forked-subagent test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("codex-rs/core/tests/suite/subagent_notifications.rs")
+          text = path.read_text()
+          old = '''    let spawn_args = serde_json::to_string(&json!({
+                  "message": CHILD_PROMPT,
+                  "task_name": "child",
+                  "agent_type": "worker",
+              }))?;'''
+          new = '''    let spawn_args = serde_json::to_string(&json!({
+                  "message": CHILD_PROMPT,
+                  "task_name": "child",
+                  "agent_type": "worker",
+                  "fork_context": true,
+              }))?;'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one SubagentStart test anchor, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --manifest-path codex-rs/Cargo.toml --all
+          git diff --check
+
+      - name: Current main preserves SubagentStart for forked child
+        working-directory: codex-rs
+        run: just test -p codex-core subagent_start_replaces_session_start_and_injects_context
+
+      - name: Checkout v5 candidate
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source-v5
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Assert exact v5 candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "e1c0780d449871ac3e0de4e3be35997c5adbc9db"
+          test "$(git rev-parse HEAD^)" = "7c3747941a6b664c30f1e6aa72a917fd74dc22d2"
+
+      - name: Turn v5 SubagentStart test into forked-subagent test
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("codex-rs/core/tests/suite/subagent_notifications.rs")
+          text = path.read_text()
+          old = '''    let spawn_args = serde_json::to_string(&json!({
+                  "message": CHILD_PROMPT,
+                  "task_name": "child",
+                  "agent_type": "worker",
+              }))?;'''
+          new = '''    let spawn_args = serde_json::to_string(&json!({
+                  "message": CHILD_PROMPT,
+                  "task_name": "child",
+                  "agent_type": "worker",
+                  "fork_context": true,
+              }))?;'''
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one SubagentStart test anchor, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --manifest-path codex-rs/Cargo.toml --all
+          git diff --check
+
+      - name: v5 must demonstrate the suspected regression
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set +e
+          just test -p codex-core subagent_start_replaces_session_start_and_injects_context > /tmp/v5-subagent.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/v5-subagent.log
+          if [ "$status" -eq 0 ]; then
+            echo "v5 unexpectedly preserved forked SubagentStart"
+            exit 1
+          fi
+          echo "v5 regression reproduced as expected"
