@@ -65,7 +65,7 @@ fn replace_with_boundaries(input: &str, needle: &str, replacement: &str) -> Stri
         let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
         let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
 
-        if boundary_before && boundary_after {
+        if boundary_before && boundary_after && !is_literal_reference_match(bytes, start, end) {
             output.push_str(&input[last_emitted..start]);
             output.push_str(replacement);
             last_emitted = end;
@@ -104,7 +104,7 @@ fn replace_case_insensitive_with_boundaries(
         let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
         let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
 
-        if boundary_before && boundary_after {
+        if boundary_before && boundary_after && !is_literal_reference_match(bytes, start, end) {
             output.push_str(&input[last_emitted..start]);
             output.push_str(replacement);
             last_emitted = end;
@@ -119,6 +119,79 @@ fn replace_case_insensitive_with_boundaries(
 
     output.push_str(&input[last_emitted..]);
     output
+}
+
+/// Product names embedded in filesystem paths, URLs, or dotted identifiers are
+/// literal references to the source tool, not prose that should be retargeted.
+fn is_literal_reference_match(bytes: &[u8], start: usize, end: usize) -> bool {
+    if let Some(before) = start.checked_sub(1).and_then(|idx| bytes.get(idx))
+        && matches!(*before, b'/' | b'\\' | b'.')
+    {
+        return true;
+    }
+
+    if is_uri_reference_match(bytes, start, end) {
+        return true;
+    }
+
+    let Some(after) = bytes.get(end) else {
+        return false;
+    };
+    if matches!(*after, b'/' | b'\\') {
+        return true;
+    }
+
+    *after == b'.'
+        && bytes
+            .get(end + 1)
+            .is_some_and(|byte| is_reference_suffix_byte(*byte))
+}
+
+fn is_uri_reference_match(bytes: &[u8], start: usize, end: usize) -> bool {
+    if bytes.get(end) == Some(&b':')
+        && bytes
+            .get(end + 1)
+            .is_some_and(|byte| !byte.is_ascii_whitespace())
+        && is_uri_scheme(&bytes[start..end])
+    {
+        return true;
+    }
+
+    let token_start = bytes[..start]
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .map_or(0, |idx| idx + 1);
+
+    bytes[token_start..start]
+        .iter()
+        .enumerate()
+        .any(|(offset, byte)| {
+            if *byte != b':' {
+                return false;
+            }
+
+            let colon = token_start + offset;
+            let mut scheme_start = colon;
+            while scheme_start > token_start && is_uri_scheme_byte(bytes[scheme_start - 1]) {
+                scheme_start -= 1;
+            }
+            is_uri_scheme(&bytes[scheme_start..colon])
+        })
+}
+
+fn is_uri_scheme(bytes: &[u8]) -> bool {
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    first.is_ascii_alphabetic() && rest.iter().copied().all(is_uri_scheme_byte)
+}
+
+fn is_uri_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+fn is_reference_suffix_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 fn is_word_byte(byte: u8) -> bool {
