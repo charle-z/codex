@@ -1,0 +1,32 @@
+diff --git a/codex-rs/external-agent-migration/src/rewrite.rs b/codex-rs/external-agent-migration/src/rewrite.rs
+index b6b0396dd1..11cdfd9a90 100644
+--- a/codex-rs/external-agent-migration/src/rewrite.rs
++++ b/codex-rs/external-agent-migration/src/rewrite.rs
+@@ -272,9 +272,7 @@ fn is_reference_markdown_destination_prefix(destination_prefix: &[u8]) -> bool {
+             continue;
+         }
+ 
+-        if (angle_delimited && byte == b'>')
+-            || (!angle_delimited && byte.is_ascii_whitespace())
+-        {
++        if (angle_delimited && byte == b'>') || (!angle_delimited && byte.is_ascii_whitespace()) {
+             return false;
+         }
+     }
+diff --git a/codex-rs/external-agent-migration/src/rewrite_tests.rs b/codex-rs/external-agent-migration/src/rewrite_tests.rs
+index 8880b77cd0..72eecfb0db 100644
+--- a/codex-rs/external-agent-migration/src/rewrite_tests.rs
++++ b/codex-rs/external-agent-migration/src/rewrite_tests.rs
+@@ -165,8 +165,10 @@ fn preserves_markdown_reference_destinations_but_retargets_titles() {
+ 
+ #[test]
+ fn preserves_escaped_markdown_inline_destinations() {
+-    let input = r#"[close](foo\)claude) [space](foo\ claude) [title](https://example.test/ "Claude")"#;
+-    let expected = r#"[close](foo\)claude) [space](foo\ claude) [title](https://example.test/ "Codex")"#;
++    let input =
++        r#"[close](foo\)claude) [space](foo\ claude) [title](https://example.test/ "Claude")"#;
++    let expected =
++        r#"[close](foo\)claude) [space](foo\ claude) [title](https://example.test/ "Codex")"#;
+ 
+     assert_eq!(CLAUDE_PROFILE.rewrite(input), expected);
+ }
