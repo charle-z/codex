@@ -1,0 +1,9 @@
+candidate=38c06e544374dbc186c724d9783364cf9dd47256
+base=89650c66f2a817378f0935325dbb062d25fb0202
+shape=failure
+crate=success
+fmt_before=success
+fix=success
+clippy=success
+fmt_after=success
+clean=success
