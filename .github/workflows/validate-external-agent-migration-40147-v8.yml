@@ -6,10 +6,11 @@ on:
       - validation/run-40147-v8
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   migration:
+    if: ${{ !startsWith(github.event.head_commit.message, 'validation-result:') }}
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -26,6 +27,7 @@ jobs:
           tool: nextest
           version: 0.9.103
       - name: Assert exact source shape
+        id: shape
         run: |
           test "$(git rev-parse HEAD)" = "9636111caa409b872adddbfedf699c44d5d352b2"
           test "$(git rev-list --count 2c4a95736bea64256a50f7b8506bd33c181cc85a..HEAD)" -eq 1
@@ -34,6 +36,7 @@ jobs:
           expected=$'codex-rs/external-agent-migration/src/rewrite.rs\ncodex-rs/external-agent-migration/src/rewrite_tests.rs'
           test "$files" = "$expected"
       - name: Run explicit adversarial rewrite matrix
+        id: matrix
         run: |
           cat > /tmp/rewrite_40147_matrix.rs <<'RS'
           mod rewrite {
@@ -80,13 +83,40 @@ jobs:
           rustc --edition=2024 /tmp/rewrite_40147_matrix.rs -o /tmp/rewrite_40147_matrix
           /tmp/rewrite_40147_matrix
       - name: Test external-agent migration crate
+        id: crate
         run: just test -p codex-external-agent-migration
       - name: Apply scoped clippy fixes
+        id: fix
         run: just fix -p codex-external-agent-migration
       - name: Run scoped clippy
+        id: clippy
         run: just clippy -p codex-external-agent-migration -- -D warnings
       - name: Check Rust formatting
+        id: fmt
         working-directory: codex-rs
         run: cargo fmt -- --config imports_granularity=Item --check
       - name: Verify validation did not change tracked files
+        id: clean
         run: git diff --exit-code
+
+  report:
+    if: ${{ always() && !startsWith(github.event.head_commit.message, 'validation-result:') }}
+    needs: migration
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: validation/run-40147-v8
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Publish bounded validation result
+        env:
+          RESULT: ${{ needs.migration.result }}
+        run: |
+          mkdir -p .validation
+          printf 'candidate=9636111caa409b872adddbfedf699c44d5d352b2\nbase=2c4a95736bea64256a50f7b8506bd33c181cc85a\nresult=%s\n' "$RESULT" > .validation/40147-v8.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .validation/40147-v8.txt
+          git commit -m "validation-result: 40147 v8"
+          git push origin HEAD:validation/run-40147-v8
