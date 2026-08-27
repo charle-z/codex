@@ -1,7 +1,9 @@
 name: validate-39951-subagent-fork
 
 on:
-  workflow_dispatch:
+  push:
+    branches:
+      - validation/39951-subagent-fork-v2
 
 permissions:
   contents: read
