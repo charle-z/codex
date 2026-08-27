@@ -1,0 +1,9 @@
+candidate=3d4c548c32de664894184575e8b7e89a160169eb
+base=694edc23b22b4696400dc47663ecacd437623870
+shape=success
+matrix=success
+crate=success
+fix=success
+clippy=success
+fmt=failure
+clean=success
