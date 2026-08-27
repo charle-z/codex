@@ -65,7 +65,7 @@ fn replace_with_boundaries(input: &str, needle: &str, replacement: &str) -> Stri
         let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
         let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
 
-        if boundary_before && boundary_after {
+        if boundary_before && boundary_after && !is_literal_reference_match(bytes, start, end) {
             output.push_str(&input[last_emitted..start]);
             output.push_str(replacement);
             last_emitted = end;
@@ -104,7 +104,7 @@ fn replace_case_insensitive_with_boundaries(
         let boundary_before = start == 0 || !is_word_byte(bytes[start - 1]);
         let boundary_after = end == bytes.len() || !is_word_byte(bytes[end]);
 
-        if boundary_before && boundary_after {
+        if boundary_before && boundary_after && !is_literal_reference_match(bytes, start, end) {
             output.push_str(&input[last_emitted..start]);
             output.push_str(replacement);
             last_emitted = end;
@@ -119,6 +119,139 @@ fn replace_case_insensitive_with_boundaries(
 
     output.push_str(&input[last_emitted..]);
     output
+}
+
+/// Product names embedded in filesystem paths, URI references, Markdown link destinations, or
+/// dotted identifiers are literal references to the source tool, not prose to retarget.
+fn is_literal_reference_match(bytes: &[u8], start: usize, end: usize) -> bool {
+    if let Some(before) = start.checked_sub(1).and_then(|idx| bytes.get(idx))
+        && matches!(*before, b'/' | b'\\' | b'.')
+    {
+        return true;
+    }
+
+    if is_markdown_link_destination_match(bytes, start) {
+        return true;
+    }
+    if is_uri_reference_match(bytes, start, end) {
+        return true;
+    }
+
+    let Some(after) = bytes.get(end) else {
+        return false;
+    };
+    if matches!(*after, b'/' | b'\\') {
+        return true;
+    }
+
+    *after == b'.'
+        && bytes
+            .get(end + 1)
+            .is_some_and(|byte| is_reference_suffix_byte(*byte))
+}
+
+fn is_uri_reference_match(bytes: &[u8], start: usize, end: usize) -> bool {
+    if is_relative_uri_component_match(bytes, start, end) {
+        return true;
+    }
+
+    if bytes.get(end) == Some(&b':')
+        && bytes
+            .get(end + 1)
+            .is_some_and(|byte| is_uri_payload_start_byte(*byte))
+        && is_uri_scheme(&bytes[start..end])
+    {
+        return true;
+    }
+
+    let token_start = bytes[..start]
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .map_or(0, |idx| idx + 1);
+
+    bytes[token_start..start]
+        .iter()
+        .enumerate()
+        .any(|(offset, byte)| {
+            if *byte != b':' {
+                return false;
+            }
+
+            let colon = token_start + offset;
+            let mut scheme_start = colon;
+            while scheme_start > token_start && is_uri_scheme_byte(bytes[scheme_start - 1]) {
+                scheme_start -= 1;
+            }
+            is_uri_scheme(&bytes[scheme_start..colon])
+        })
+}
+
+fn is_relative_uri_component_match(bytes: &[u8], start: usize, end: usize) -> bool {
+    let token_start = bytes[..start]
+        .iter()
+        .rposition(u8::is_ascii_whitespace)
+        .map_or(0, |idx| idx + 1);
+
+    if bytes[token_start..start]
+        .iter()
+        .any(|byte| matches!(*byte, b'?' | b'#'))
+    {
+        return true;
+    }
+
+    bytes.get(end).is_some_and(|byte| {
+        matches!(*byte, b'?' | b'#')
+            && bytes
+                .get(end + 1)
+                .is_some_and(|next| is_uri_payload_start_byte(*next))
+    })
+}
+
+fn is_markdown_link_destination_match(bytes: &[u8], start: usize) -> bool {
+    let line_start = bytes[..start]
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |idx| idx + 1);
+    let prefix = &bytes[line_start..start];
+    let Some(opener) = prefix.windows(2).rposition(|window| window == b"](") else {
+        return false;
+    };
+
+    let destination_prefix = &prefix[opener + 2..];
+    let mut nested_parentheses = 0usize;
+    for byte in destination_prefix {
+        match *byte {
+            b'(' => nested_parentheses += 1,
+            b')' if nested_parentheses > 0 => nested_parentheses -= 1,
+            b')' => return false,
+            byte if byte.is_ascii_whitespace() && nested_parentheses == 0 => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn is_uri_payload_start_byte(byte: u8) -> bool {
+    is_reference_suffix_byte(byte)
+        || matches!(
+            byte,
+            b'/' | b'.' | b'~' | b'%' | b':' | b'@' | b'?' | b'#' | b'[' | b'+'
+        )
+}
+
+fn is_uri_scheme(bytes: &[u8]) -> bool {
+    let Some((first, rest)) = bytes.split_first() else {
+        return false;
+    };
+    first.is_ascii_alphabetic() && rest.iter().copied().all(is_uri_scheme_byte)
+}
+
+fn is_uri_scheme_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.')
+}
+
+fn is_reference_suffix_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 fn is_word_byte(byte: u8) -> bool {
