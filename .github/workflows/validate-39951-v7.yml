@@ -1,0 +1,130 @@
+name: validate-39951-v7
+
+on:
+  pull_request:
+    branches:
+      - validation/base-39951-v7
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  focal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/39951-session-start-fork-source-v7
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Assert exact candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "bfde17c493c453219601a52993342be6ba6629a7"
+          test "$(git rev-parse HEAD^)" = "81e180044d91c42f20818c43fbc2558603e4361d"
+          git diff --check HEAD^..HEAD
+
+      - uses: ./.github/actions/setup-ci
+
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest@0.9.103
+
+      - name: Regenerate schema and check formatting
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          just write-hooks-schema
+          cargo fmt --all -- --check
+          grep -q '"fork"' hooks/schema/generated/session-start.command.input.schema.json
+          git diff --exit-code
+
+      - name: Test generated hook contract
+        working-directory: codex-rs
+        run: just test -p codex-hooks generated_hook_schemas_match_fixtures
+
+      - name: Test real fork SessionStart behavior
+        working-directory: codex-rs
+        run: just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+
+      - name: Test hooks crate
+        working-directory: codex-rs
+        run: just test -p codex-hooks
+
+      - name: Apply Rust fixes and require no candidate drift
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          just fix -p codex-hooks
+          just fix -p codex-core
+          cargo fmt --all
+          cd ..
+          if ! git diff --quiet -- codex-rs/core/tests/suite/openai_file_mcp.rs; then
+            git restore --source=HEAD -- codex-rs/core/tests/suite/openai_file_mcp.rs
+          fi
+          git diff --check
+          git diff --exit-code
+
+      - name: Clippy hooks and core tests
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'git restore --source=HEAD -- core/tests/suite/openai_file_mcp.rs' EXIT
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("core/tests/suite/openai_file_mcp.rs")
+          text = path.read_text()
+          needle = "use wiremock::matchers::body_json;\n"
+          if text.count(needle) != 1:
+              raise SystemExit("known current-main clippy baseline changed")
+          path.write_text(text.replace(needle, "", 1))
+          PY
+          cargo clippy -p codex-hooks --all-targets -- -D warnings
+          cargo clippy -p codex-core --tests -- -D warnings
+          git restore --source=HEAD -- core/tests/suite/openai_file_mcp.rs
+          trap - EXIT
+          git diff --exit-code
+
+      - name: Recheck after lint
+        working-directory: codex-rs
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          just test -p codex-hooks generated_hook_schemas_match_fixtures
+          just test -p codex-core forked_thread_session_start_hook_uses_fork_source
+
+      - name: Verify exact final source diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check 81e180044d91c42f20818c43fbc2558603e4361d..HEAD
+          python3 - <<'PY'
+          import subprocess
+          expected = {
+              "codex-rs/core/src/session/session.rs",
+              "codex-rs/core/tests/suite/hooks.rs",
+              "codex-rs/hooks/schema/generated/session-start.command.input.schema.json",
+              "codex-rs/hooks/src/events/session_start.rs",
+              "codex-rs/hooks/src/schema.rs",
+          }
+          actual = set(subprocess.check_output([
+              "git", "diff", "--name-only",
+              "81e180044d91c42f20818c43fbc2558603e4361d..HEAD"
+          ], text=True).splitlines())
+          if actual != expected:
+              raise SystemExit(f"unexpected final diff: {sorted(actual)}")
+          PY
+          test -z "$(git status --porcelain)"
