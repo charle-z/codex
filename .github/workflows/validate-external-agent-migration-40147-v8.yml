@@ -1,0 +1,92 @@
+name: validate-external-agent-migration-40147-v8
+
+on:
+  push:
+    branches:
+      - validation/run-40147-v8
+
+permissions:
+  contents: read
+
+jobs:
+  migration:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/40147-preserve-external-agent-references-v8
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+          version: 0.9.103
+      - name: Assert exact source shape
+        run: |
+          test "$(git rev-parse HEAD)" = "9636111caa409b872adddbfedf699c44d5d352b2"
+          test "$(git rev-list --count 2c4a95736bea64256a50f7b8506bd33c181cc85a..HEAD)" -eq 1
+          test -z "$(git rev-list HEAD..2c4a95736bea64256a50f7b8506bd33c181cc85a)"
+          files="$(git diff --name-only 2c4a95736bea64256a50f7b8506bd33c181cc85a...HEAD | sort)"
+          expected=$'codex-rs/external-agent-migration/src/rewrite.rs\ncodex-rs/external-agent-migration/src/rewrite_tests.rs'
+          test "$files" = "$expected"
+      - name: Run explicit adversarial rewrite matrix
+        run: |
+          cat > /tmp/rewrite_40147_matrix.rs <<'RS'
+          mod rewrite {
+              include!(concat!(env!("GITHUB_WORKSPACE"), "/codex-rs/external-agent-migration/src/rewrite.rs"));
+          }
+
+          use rewrite::RewriteProfile;
+
+          const CLAUDE: RewriteProfile = RewriteProfile::new(
+              "CLAUDE.md",
+              &["claude code", "claude-code", "claude_code", "claudecode", "claude"],
+          );
+
+          fn main() {
+              let cases = [
+                  ("posix-home", "~/.claude/projects/", "~/.claude/projects/"),
+                  ("posix-dotdir", ".claude/commands/foo.md", ".claude/commands/foo.md"),
+                  ("windows-drive", r"C:\Users\x\.claude\plans", r"C:\Users\x\.claude\plans"),
+                  ("windows-unc", r"\\server\share\.claude\plans\foo.md", r"\\server\share\.claude\plans\foo.md"),
+                  ("url", "https://claude.example/.claude/docs", "https://claude.example/.claude/docs"),
+                  ("query-fragment", "https://example/?agent=claude#claude", "https://example/?agent=claude#claude"),
+                  ("hierarchical-scheme", "claude://session?id=claude", "claude://session?id=claude"),
+                  ("opaque-scheme", "claude:session", "claude:session"),
+                  ("urn", "urn:claude:session", "urn:claude:session"),
+                  ("mailto", "mailto:claude@example.com", "mailto:claude@example.com"),
+                  ("quoted-posix", "`~/.claude/projects/foo`", "`~/.claude/projects/foo`"),
+                  ("quoted-windows", r#""C:\Users\x\.claude\plans""#, r#""C:\Users\x\.claude\plans""#),
+                  ("markdown-link", "[docs](https://example/.claude/CLAUDE.md?agent=claude#claude)", "[docs](https://example/.claude/CLAUDE.md?agent=claude#claude)"),
+                  ("dotted-id", "com.claude.agent", "com.claude.agent"),
+                  ("hostname", "claude.example.com", "claude.example.com"),
+                  ("path-qualified-doc", ".claude/CLAUDE.md", ".claude/CLAUDE.md"),
+                  ("prose-product", "Claude Code UI", "Codex UI"),
+                  ("prose-doc", "Read CLAUDE.md before editing.", "Read AGENTS.md before editing."),
+                  ("prose-label", "Claude: use the UI.", "Codex: use the UI."),
+              ];
+
+              for (name, input, expected) in cases {
+                  let actual = CLAUDE.rewrite(input);
+                  assert_eq!(actual, expected, "case={name}, input={input}");
+                  println!("PASS\t{name}");
+              }
+          }
+          RS
+          rustc --edition=2024 /tmp/rewrite_40147_matrix.rs -o /tmp/rewrite_40147_matrix
+          /tmp/rewrite_40147_matrix
+      - name: Test external-agent migration crate
+        run: just test -p codex-external-agent-migration
+      - name: Apply scoped clippy fixes
+        run: just fix -p codex-external-agent-migration
+      - name: Run scoped clippy
+        run: just clippy -p codex-external-agent-migration -- -D warnings
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Verify validation did not change tracked files
+        run: git diff --exit-code
