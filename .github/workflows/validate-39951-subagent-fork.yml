@@ -51,9 +51,14 @@ jobs:
                   "agent_type": "worker",
                   "fork_context": true,
               }))?;'''
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one SubagentStart test anchor, found {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
+          start = text.index("async fn subagent_start_replaces_session_start_and_injects_context")
+          end = text.index("\n#[tokio::test", start + 1)
+          section = text[start:end]
+          if section.count(old) != 1:
+              raise SystemExit(
+                  f"expected one SubagentStart test anchor in target function, found {section.count(old)}"
+              )
+          path.write_text(text[:start] + section.replace(old, new, 1) + text[end:])
           PY
           cargo fmt --manifest-path codex-rs/Cargo.toml --all
           git diff --check
@@ -96,9 +101,14 @@ jobs:
                   "agent_type": "worker",
                   "fork_context": true,
               }))?;'''
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one SubagentStart test anchor, found {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
+          start = text.index("async fn subagent_start_replaces_session_start_and_injects_context")
+          end = text.index("\n#[tokio::test", start + 1)
+          section = text[start:end]
+          if section.count(old) != 1:
+              raise SystemExit(
+                  f"expected one SubagentStart test anchor in target function, found {section.count(old)}"
+              )
+          path.write_text(text[:start] + section.replace(old, new, 1) + text[end:])
           PY
           cargo fmt --manifest-path codex-rs/Cargo.toml --all
           git diff --check
