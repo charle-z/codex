@@ -1,0 +1,125 @@
+name: validate-external-agent-migration-40147-v10
+
+on:
+  push:
+    branches:
+      - validation/run-40147-v10
+
+permissions:
+  contents: write
+
+jobs:
+  migration:
+    if: ${{ !startsWith(github.event.head_commit.message, 'validation-result:') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: fix/40147-preserve-external-agent-references-v10
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/setup-ci
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        with:
+          components: rustfmt, clippy
+      - uses: taiki-e/install-action@44c6d64aa62cd779e873306675c7a58e86d6d532 # v2.62.49
+        with:
+          tool: nextest
+          version: 0.9.103
+      - name: Assert exact source shape
+        run: |
+          test "$(git rev-parse HEAD)" = "38c06e544374dbc186c724d9783364cf9dd47256"
+          test "$(git rev-list --count 89650c66f2a817378f0935325dbb062d25fb0202..HEAD)" -eq 1
+          test -z "$(git rev-list HEAD..89650c66f2a817378f0935325dbb062d25fb0202)"
+          files="$(git diff --name-only 89650c66f2a817378f0935325dbb062d25fb0202...HEAD | sort)"
+          expected=$'codex-rs/external-agent-migration/src/rewrite.rs\ncodex-rs/external-agent-migration/src/rewrite_tests.rs'
+          test "$files" = "$expected"
+      - name: Run explicit adversarial rewrite matrix
+        run: |
+          cat > /tmp/rewrite_40147_matrix.rs <<'RS'
+          mod rewrite {
+              include!(concat!(env!("GITHUB_WORKSPACE"), "/codex-rs/external-agent-migration/src/rewrite.rs"));
+          }
+
+          use rewrite::RewriteProfile;
+
+          const CLAUDE: RewriteProfile = RewriteProfile::new(
+              "CLAUDE.md",
+              &["claude code", "claude-code", "claude_code", "claudecode", "claude"],
+          );
+
+          fn main() {
+              let cases = [
+                  ("posix-home", "~/.claude/projects/", "~/.claude/projects/"),
+                  ("posix-dotdir", ".claude/commands/foo.md", ".claude/commands/foo.md"),
+                  ("windows-drive", r"C:\Users\x\.claude\plans", r"C:\Users\x\.claude\plans"),
+                  ("windows-unc", r"\\server\share\.claude\plans\foo.md", r"\\server\share\.claude\plans\foo.md"),
+                  ("url", "https://claude.example/.claude/docs", "https://claude.example/.claude/docs"),
+                  ("url-query-fragment", "https://example/?agent=claude#claude", "https://example/?agent=claude#claude"),
+                  ("hierarchical-scheme", "claude://session?id=claude", "claude://session?id=claude"),
+                  ("opaque-scheme", "claude:session", "claude:session"),
+                  ("urn", "urn:claude:session", "urn:claude:session"),
+                  ("mailto-uri", "mailto:claude@example.com", "mailto:claude@example.com"),
+                  ("relative-query", "?agent=claude", "?agent=claude"),
+                  ("relative-fragment", "foo#claude", "foo#claude"),
+                  ("relative-path-query", "claude?agent=1", "claude?agent=1"),
+                  ("relative-path-fragment", "claude#section", "claude#section"),
+                  ("protocol-relative", "//example.test/?agent=Claude#claude", "//example.test/?agent=Claude#claude"),
+                  ("quoted-posix", "`~/.claude/projects/foo`", "`~/.claude/projects/foo`"),
+                  ("quoted-windows", r#""C:\Users\x\.claude\plans""#, r#""C:\Users\x\.claude\plans""#),
+                  ("markdown-relative", "[docs](claude)", "[docs](claude)"),
+                  ("markdown-fragment", "[docs](#claude)", "[docs](#claude)"),
+                  ("markdown-query", "[docs](?agent=claude)", "[docs](?agent=claude)"),
+                  ("markdown-link-text", "[Claude](https://example.test/)", "[Codex](https://example.test/)"),
+                  ("markdown-link-title", "[docs](https://example.test/ \"Claude\")", "[docs](https://example.test/ \"Codex\")"),
+                  ("dotted-id", "com.claude.agent", "com.claude.agent"),
+                  ("hostname", "claude.example.com", "claude.example.com"),
+                  ("path-qualified-doc", ".claude/CLAUDE.md", ".claude/CLAUDE.md"),
+                  ("prose-product", "Claude Code UI", "Codex UI"),
+                  ("prose-doc", "Read CLAUDE.md before editing.", "Read AGENTS.md before editing."),
+                  ("prose-label", "Claude: use the UI.", "Codex: use the UI."),
+                  ("prose-question", "Ask Claude? Ask Claude?\"", "Ask Codex? Ask Codex?\""),
+              ];
+
+              for (name, input, expected) in cases {
+                  let actual = CLAUDE.rewrite(input);
+                  assert_eq!(actual, expected, "case={name}, input={input}");
+                  println!("PASS\t{name}");
+              }
+          }
+          RS
+          rustc --edition=2024 /tmp/rewrite_40147_matrix.rs -o /tmp/rewrite_40147_matrix
+          /tmp/rewrite_40147_matrix
+      - name: Test external-agent migration crate
+        run: just test -p codex-external-agent-migration
+      - name: Apply scoped clippy fixes
+        run: just fix -p codex-external-agent-migration
+      - name: Run scoped clippy
+        run: just clippy -p codex-external-agent-migration -- -D warnings
+      - name: Check Rust formatting
+        working-directory: codex-rs
+        run: cargo fmt -- --config imports_granularity=Item --check
+      - name: Verify validation did not change tracked files
+        run: git diff --exit-code
+
+  report:
+    if: ${{ always() && !startsWith(github.event.head_commit.message, 'validation-result:') }}
+    needs: migration
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: validation/run-40147-v10
+          fetch-depth: 1
+          persist-credentials: true
+      - name: Publish bounded validation result
+        env:
+          RESULT: ${{ needs.migration.result }}
+        run: |
+          mkdir -p .validation
+          printf 'candidate=38c06e544374dbc186c724d9783364cf9dd47256\nbase=89650c66f2a817378f0935325dbb062d25fb0202\nresult=%s\n' "$RESULT" > .validation/40147-v10.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .validation/40147-v10.txt
+          git commit -m "validation-result: 40147 v10"
+          git push origin HEAD:validation/run-40147-v10
