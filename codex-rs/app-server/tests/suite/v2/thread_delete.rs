@@ -170,9 +170,88 @@ async fn thread_delete_deletes_spawned_descendants() -> Result<()> {
 }
 
 #[tokio::test]
+async fn thread_delete_preserves_rollouts_and_state_when_logs_db_is_locked_at_startup() -> Result<()>
+{
+    let codex_home = TempDir::new()?;
+    let parent_id = create_delete_test_rollout(codex_home.path(), /*minute*/ 0, "parent")?;
+    let child_id = create_delete_test_rollout(codex_home.path(), /*minute*/ 1, "child")?;
+    let parent_thread_id = ThreadId::from_string(&parent_id)?;
+    let child_thread_id = ThreadId::from_string(&child_id)?;
+    let sqlite = SqliteConfig::new_for_testing(codex_home.path().abs());
+
+    let state_db = StateRuntime::init(sqlite.clone(), "mock_provider".into()).await?;
+    state_db
+        .upsert_thread_spawn_edge(
+            parent_thread_id,
+            child_thread_id,
+            DirectionalThreadSpawnEdgeStatus::Closed,
+        )
+        .await?;
+    state_db.close().await;
+    drop(state_db);
+
+    let logs_pool = sqlite
+        .open_read_write_pool(sqlite.logs_db_path().as_path())
+        .await?;
+    sqlx::query("CREATE TABLE lock_holder (value INTEGER NOT NULL)")
+        .execute(&logs_pool)
+        .await?;
+    let mut log_lock = logs_pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *log_lock)
+        .await?;
+    sqlx::query("INSERT INTO lock_holder (value) VALUES (1)")
+        .execute(&mut *log_lock)
+        .await?;
+
+    let mut mcp = TestAppServer::builder()
+        .with_codex_home(codex_home.path())
+        .without_auto_env()
+        .build_initialized()
+        .await?;
+    let delete_id = mcp
+        .send_thread_delete_request(ThreadDeleteParams {
+            thread_id: parent_id.clone(),
+        })
+        .await?;
+    let delete_err: JSONRPCError = timeout(
+        DEFAULT_READ_TIMEOUT,
+        mcp.read_stream_until_error_message(RequestId::Integer(delete_id)),
+    )
+    .await??;
+    assert_eq!(delete_err.error.code, -32603);
+    assert!(
+        delete_err.error.message.contains("persistent log store"),
+        "unexpected delete error: {delete_err:?}"
+    );
+
+    for thread_id in [&parent_id, &child_id] {
+        assert!(
+            find_thread_path_by_id_str(codex_home.path(), thread_id, /*state_db_ctx*/ None)
+                .await?
+                .is_some(),
+            "expected rollout for {thread_id} to remain"
+        );
+    }
+
+    sqlx::query("ROLLBACK").execute(&mut *log_lock).await?;
+    drop(log_lock);
+    logs_pool.close().await;
+
+    let recovered_state = StateRuntime::init(sqlite, "mock_provider".into()).await?;
+    assert_eq!(
+        recovered_state
+            .list_thread_spawn_descendants(parent_thread_id)
+            .await?,
+        vec![child_thread_id]
+    );
+    recovered_state.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn thread_delete_preflights_external_fork_references_for_spawned_subtrees() -> Result<()> {
     let codex_home = TempDir::new()?;
-
     let parent_id = create_delete_test_rollout(codex_home.path(), /*minute*/ 0, "parent")?;
     let child_id = create_delete_test_rollout(codex_home.path(), /*minute*/ 1, "child")?;
     let external_id = create_delete_test_rollout(codex_home.path(), /*minute*/ 2, "external")?;
