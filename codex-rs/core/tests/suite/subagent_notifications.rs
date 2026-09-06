@@ -1022,7 +1022,19 @@ async fn spawned_child_receives_forked_parent_context(
 
     let mut builder = test_codex()
         .with_history_mode(history_mode)
+        .with_pre_build_hook(|home| {
+            write_subagent_lifecycle_hooks(home, /*stop_prompts*/ &[], "worker")
+                .expect("write forked subagent hook fixture");
+            let hooks_path = home.join("hooks.json");
+            let mut hooks: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(&hooks_path).expect("read forked subagent hooks"),
+            )
+            .expect("parse forked subagent hooks");
+            hooks["hooks"]["SubagentStart"][0]["matcher"] = json!("default");
+            std::fs::write(hooks_path, hooks.to_string()).expect("match the default subagent role");
+        })
         .with_config(|config| {
+            trust_discovered_hooks(config);
             config
                 .features
                 .enable(Feature::Collab)
@@ -1042,6 +1054,22 @@ async fn spawned_child_receives_forked_parent_context(
 
     let child_request = wait_for_request_with_model(&child_request_log, REQUESTED_MODEL).await?;
     assert!(child_request.body_contains_text(TURN_0_FORK_PROMPT));
+    assert!(child_request.body_contains_text(SUBAGENT_START_CONTEXT));
+    let start_inputs = wait_for_hook_log(
+        test.codex_home_path(),
+        "subagent_start_hook_log.jsonl",
+        /*expected_len*/ 1,
+    )
+    .await?;
+    assert_eq!(start_inputs.len(), 1);
+    let session_start_inputs = wait_for_hook_log(
+        test.codex_home_path(),
+        "session_start_hook_log.jsonl",
+        /*expected_len*/ 1,
+    )
+    .await?;
+    assert_eq!(session_start_inputs.len(), 1);
+    assert_eq!(session_start_inputs[0]["source"], json!("startup"));
     let child_body = child_request.body_json();
     let child_metadata: serde_json::Value = serde_json::from_str(
         child_body["client_metadata"]["x-codex-turn-metadata"]

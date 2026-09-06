@@ -7,6 +7,7 @@ use anyhow::Result;
 use codex_config::HookStateToml;
 use codex_config::McpServerConfig;
 use codex_config::test_support::CloudConfigBundleFixture;
+use codex_core::ForkSnapshot;
 use codex_core::StartThreadOptions;
 use codex_core::TurnInput;
 use codex_core::TurnInputRequest;
@@ -1609,6 +1610,106 @@ async fn session_start_runs_before_user_prompt_submit_on_first_turn() -> Result<
         Some("hello")
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_thread_session_start_hook_uses_fork_source() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let responses = mount_sse_sequence(
+        &server,
+        vec![
+            sse(vec![
+                ev_response_created("resp-parent"),
+                ev_assistant_message("msg-parent", "parent turn complete"),
+                ev_completed("resp-parent"),
+            ]),
+            sse(vec![
+                ev_response_created("resp-fork"),
+                ev_assistant_message("msg-fork", "fork turn complete"),
+                ev_completed("resp-fork"),
+            ]),
+        ],
+    )
+    .await;
+
+    let mut builder = test_codex()
+        .with_pre_build_hook(|home| {
+            write_session_start_and_user_prompt_submit_order_hooks(home)
+                .expect("failed to write hook ordering fixtures");
+            let hooks_path = home.join("hooks.json");
+            let mut hooks: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            write_session_start_hook_with_context(home, "startup-context-for-fork-regression")
+                .expect("failed to write startup context fixture");
+            let mut context_hooks: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            let mut startup_hook = context_hooks["hooks"]["SessionStart"][0].take();
+            startup_hook["matcher"] = serde_json::json!("startup");
+            hooks["hooks"]["SessionStart"]
+                .as_array_mut()
+                .unwrap()
+                .push(startup_hook);
+            fs::write(hooks_path, hooks.to_string()).expect("write combined hook fixtures");
+        })
+        .with_config(trust_discovered_hooks);
+    let test = builder.build_with_auto_env(&server).await?;
+
+    test.submit_turn("parent prompt").await?;
+    test.codex.flush_rollout().await?;
+    let rollout_path = test.codex.rollout_path().expect("parent rollout path");
+    let forked = test
+        .thread_manager
+        .fork_thread(
+            ForkSnapshot::Interrupted,
+            test.config.clone(),
+            rollout_path,
+            /*thread_source*/ None,
+            /*parent_trace*/ None,
+        )
+        .await?
+        .thread;
+
+    forked
+        .start_or_steer_turn(TurnInputRequest::user_input(vec![UserInput::Text {
+            text: "fork prompt".to_string(),
+            text_elements: Vec::new(),
+        }]))
+        .await?;
+    wait_for_event(&forked, |event| matches!(event, EventMsg::TurnComplete(_))).await;
+
+    let session_start_sources = read_hook_order_inputs(test.codex_home_path())?
+        .into_iter()
+        .filter(|input| input["hook_event_name"] == "SessionStart")
+        .map(|input| {
+            input["source"]
+                .as_str()
+                .expect("SessionStart source")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(session_start_sources, vec!["startup", "fork"]);
+
+    let context_copies: Vec<usize> = responses
+        .requests()
+        .iter()
+        .map(|request| {
+            request
+                .message_input_texts("developer")
+                .iter()
+                .map(|message| {
+                    message
+                        .matches("startup-context-for-fork-regression")
+                        .count()
+                })
+                .sum()
+        })
+        .collect();
+    assert_eq!(context_copies, vec![1, 1]);
+
+    forked.shutdown_and_wait().await?;
     Ok(())
 }
 
