@@ -158,6 +158,12 @@ impl OAuthPersistor {
         // Preserve RMCP's `AuthorizationRequired` marker only for credentials known to be
         // unrefreshable. Network and provider failures below remain ordinary errors.
         if !latest.has_refresh_token() {
+            let manager = self.inner.authorization_manager.clone();
+            let mut guard = manager.lock().await;
+            install_tokens_in_manager(&mut guard, &latest)
+                .await
+                .context("failed to adopt authoritative unrefreshable OAuth credentials")?;
+            *self.inner.last_credentials.lock().await = Some(latest);
             return Err(AuthError::AuthorizationRequired).with_context(|| {
                 format!(
                     "OAuth tokens for server {} cannot be refreshed; authorization required",
@@ -198,6 +204,54 @@ impl OAuthPersistor {
                     error = %error,
                     "MCP OAuth refresh token was rejected; reauthorization required"
                 );
+                let mut rejected = latest.clone();
+                rejected.token_response.0.set_refresh_token(None);
+
+                match self.inner.credential_store.save(
+                    keyring_store,
+                    &self.inner.server_name,
+                    &rejected,
+                ) {
+                    Ok(()) => {
+                        if let Err(install_error) =
+                            install_tokens_in_manager(&mut guard, &rejected).await
+                        {
+                            guard.set_credential_store(InMemoryCredentialStore::new());
+                            *self.inner.last_credentials.lock().await = None;
+                            return Err(install_error).context(
+                                "rejected OAuth refresh-token state was persisted but could not be installed in the authorization manager",
+                            );
+                        }
+                        *self.inner.last_credentials.lock().await = Some(rejected);
+                    }
+                    Err(save_error) => {
+                        warn!(
+                            error = %save_error,
+                            "failed to persist rejected OAuth refresh-token state; removing the authoritative credential instead"
+                        );
+                        let delete_result = self.inner.credential_store.delete(
+                            keyring_store,
+                            &self.inner.server_name,
+                            &self.inner.url,
+                        );
+                        guard.set_credential_store(InMemoryCredentialStore::new());
+                        *self.inner.last_credentials.lock().await = None;
+
+                        if let Err(delete_error) = delete_result {
+                            anyhow::bail!(
+                                "failed to persist rejected OAuth refresh-token state for server {}: {save_error}; failed to remove the rejected OAuth credential: {delete_error}",
+                                self.inner.server_name
+                            );
+                        }
+
+                        return Err(AuthError::AuthorizationRequired).with_context(|| {
+                            format!(
+                                "failed to refresh OAuth tokens for server {}: {error}; rejected refresh-token state could not be persisted and the credential was removed instead: {save_error}",
+                                self.inner.server_name
+                            )
+                        });
+                    }
+                }
                 return Err(AuthError::AuthorizationRequired).with_context(|| {
                     format!(
                         "failed to refresh OAuth tokens for server {}: {error}",

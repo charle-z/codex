@@ -27,6 +27,7 @@ use rmcp::transport::auth::AuthError;
 use rmcp::transport::auth::AuthorizationManager;
 use rmcp::transport::auth::CredentialRefreshGuard;
 use rmcp::transport::auth::CredentialStore;
+use rmcp::transport::auth::InMemoryCredentialStore;
 use rmcp::transport::auth::StoredCredentials;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -40,8 +41,15 @@ use super::WrappedOAuthTokenResponse;
 use super::normalized_oauth_credentials;
 use super::refresh_expires_in_from_timestamp;
 use super::refresh_transaction::REFRESH_REQUEST_TIMEOUT;
+use super::refresh_transaction::install_tokens_in_manager;
 use super::token_needs_refresh;
 use super::validate_refresh_token_issuer;
+
+#[derive(Clone, Copy)]
+enum RejectedRefreshPersistence {
+    Sanitized,
+    Removed,
+}
 
 #[derive(Clone)]
 pub(crate) struct OAuthCredentialStore<K = DefaultKeyringStore> {
@@ -100,16 +108,52 @@ impl<K: KeyringStore + Clone + 'static> OAuthCredentialStore<K> {
         // Reuse the guard for RMCP's exchange and save after the locked freshness check.
         manager.set_credential_store(Self {
             inner: Arc::clone(&self.inner),
-            held_refresh_guard: Some(guard),
+            held_refresh_guard: Some(Arc::clone(&guard)),
         });
         let result = PROACTIVE_REFRESH_TIMEOUT
             .scope(REFRESH_REQUEST_TIMEOUT, manager.refresh_token())
             .await;
-        manager.set_credential_store(self.clone());
         match result {
-            Ok(_) => Ok(()),
-            Err(AuthError::TokenRefreshRejected(_)) => Err(AuthError::AuthorizationRequired.into()),
-            Err(error) => Err(error.into()),
+            Ok(_) => {
+                manager.set_credential_store(self.clone());
+                Ok(())
+            }
+            Err(error @ AuthError::TokenRefreshRejected(_)) => {
+                let mut rejected = tokens;
+                rejected.token_response.0.set_refresh_token(None);
+                match self.persist_rejected_refresh(rejected.clone()).await {
+                    Ok(RejectedRefreshPersistence::Sanitized) => {
+                        if let Err(install_error) =
+                            install_tokens_in_manager(manager, &rejected).await
+                        {
+                            manager.set_credential_store(InMemoryCredentialStore::new());
+                            *self.inner.last_credentials.lock().await = None;
+                            return Err(install_error).context(
+                                "rejected OAuth refresh-token state was persisted but could not be installed in the authorization manager",
+                            );
+                        }
+                        manager.set_credential_store(self.clone());
+                    }
+                    Ok(RejectedRefreshPersistence::Removed) => {
+                        manager.set_credential_store(InMemoryCredentialStore::new());
+                    }
+                    Err(storage_error) => {
+                        manager.set_credential_store(InMemoryCredentialStore::new());
+                        *self.inner.last_credentials.lock().await = None;
+                        return Err(storage_error);
+                    }
+                }
+                Err(AuthError::AuthorizationRequired).with_context(|| {
+                    format!(
+                        "failed to refresh OAuth tokens for server {}: {error}",
+                        self.inner.server_name
+                    )
+                })
+            }
+            Err(error) => {
+                manager.set_credential_store(self.clone());
+                Err(error.into())
+            }
         }
     }
 
@@ -136,10 +180,63 @@ impl<K: KeyringStore + Clone + 'static> OAuthCredentialStore<K> {
         .map_err(credential_store_error)?
         .map_err(credential_store_error)?
         .ok_or(AuthError::AuthorizationRequired)?;
-        self.validate_connection(&tokens)?;
+        if let Err(error) = self.validate_connection(&tokens) {
+            if matches!(&error, AuthError::TokenExpired) {
+                *self.inner.last_credentials.lock().await = Some(tokens);
+            }
+            return Err(error);
+        }
         *self.inner.last_credentials.lock().await = Some(tokens);
         *self.inner.refresh_guard.lock().await = Arc::downgrade(&guard);
         Ok(guard)
+    }
+
+    async fn persist_rejected_refresh(
+        &self,
+        rejected: StoredOAuthTokens,
+    ) -> Result<RejectedRefreshPersistence> {
+        let guard = self
+            .inner
+            .refresh_guard
+            .lock()
+            .await
+            .upgrade()
+            .context("OAuth credential mutation requires an active refresh guard")?;
+        let inner = Arc::clone(&self.inner);
+        let durable = rejected.clone();
+        let persistence = tokio::task::spawn_blocking(move || -> Result<_> {
+            let _guard = guard;
+            match inner
+                .store
+                .save(&inner.keyring, &inner.server_name, &durable)
+            {
+                Ok(()) => Ok(RejectedRefreshPersistence::Sanitized),
+                Err(save_error) => {
+                    warn!(
+                        error = %save_error,
+                        "failed to persist rejected OAuth refresh-token state; removing the authoritative credential instead"
+                    );
+                    if let Err(delete_error) =
+                        inner
+                            .store
+                            .delete(&inner.keyring, &inner.server_name, &inner.url)
+                    {
+                        anyhow::bail!(
+                            "failed to persist rejected OAuth refresh-token state for server {}: {save_error}; failed to remove the rejected OAuth credential: {delete_error}",
+                            inner.server_name
+                        );
+                    }
+                    Ok(RejectedRefreshPersistence::Removed)
+                }
+            }
+        })
+        .await
+        .context("OAuth rejected refresh-token persistence task failed")??;
+        *self.inner.last_credentials.lock().await = match persistence {
+            RejectedRefreshPersistence::Sanitized => Some(rejected),
+            RejectedRefreshPersistence::Removed => None,
+        };
+        Ok(persistence)
     }
 
     fn validate_connection(&self, tokens: &StoredOAuthTokens) -> Result<(), AuthError> {

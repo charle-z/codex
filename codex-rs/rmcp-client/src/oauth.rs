@@ -69,7 +69,9 @@ use self::store_lock::OAuthStoreLockFailure;
 
 use codex_keyring_store::DefaultKeyringStore;
 use codex_keyring_store::KeyringStore;
+use rmcp::transport::auth::AuthError;
 use rmcp::transport::auth::AuthorizationManager;
+use rmcp::transport::auth::InMemoryCredentialStore;
 use tokio::sync::Mutex;
 
 use codex_utils_home_dir::find_codex_home;
@@ -725,6 +727,74 @@ impl OAuthPersistor {
         reason = "AuthorizationManager async access must be serialized through its mutex"
     )]
     pub(crate) async fn persist_if_needed(&self) -> Result<()> {
+        let (client_id, maybe_credentials) = {
+            let manager = self.inner.authorization_manager.clone();
+            let guard = manager.lock().await;
+            guard.get_credentials().await
+        }?;
+        let locally_changed = {
+            let last_credentials = self.inner.last_credentials.lock().await;
+            match maybe_credentials.as_ref() {
+                Some(credentials) => {
+                    let token_response = WrappedOAuthTokenResponse(credentials.clone());
+                    last_credentials.as_ref().is_none_or(|previous| {
+                        previous.client_id != client_id || previous.token_response != token_response
+                    })
+                }
+                None => last_credentials.is_some(),
+            }
+        };
+        if !locally_changed {
+            return Ok(());
+        }
+
+        let _lock =
+            RefreshCredentialLock::acquire_for_server(&self.inner.server_name, &self.inner.url)
+                .await?;
+        let authoritative = self.inner.credential_store.load(
+            &DefaultKeyringStore,
+            &self.inner.server_name,
+            &self.inner.url,
+        )?;
+        let previously_observed = {
+            let last_credentials = self.inner.last_credentials.lock().await;
+            normalized_oauth_credentials(last_credentials.as_ref())
+        };
+
+        if normalized_oauth_credentials(authoritative.as_ref()) != previously_observed {
+            let manager = self.inner.authorization_manager.clone();
+            let mut guard = manager.lock().await;
+            if let Some(tokens) = authoritative.as_ref() {
+                let expected_issuer = previously_observed
+                    .as_ref()
+                    .and_then(StoredOAuthTokens::bound_issuer);
+                let authoritative_issuer = tokens.bound_issuer();
+                if authoritative_issuer != expected_issuer
+                    || (tokens.has_refresh_token() && authoritative_issuer.is_none())
+                {
+                    guard.set_credential_store(InMemoryCredentialStore::new());
+                    *self.inner.last_credentials.lock().await = None;
+                    return Err(AuthError::AuthorizationRequired).with_context(|| {
+                            format!(
+                                "OAuth credentials for server {} changed issuer while reconciling durable state; authorization required",
+                                self.inner.server_name
+                            )
+                        });
+                }
+                refresh_transaction::install_tokens_in_manager(&mut guard, tokens)
+                    .await
+                    .context(
+                        "failed to adopt authoritative OAuth credentials before persistence",
+                    )?;
+            } else {
+                guard.set_credential_store(InMemoryCredentialStore::new());
+            }
+            *self.inner.last_credentials.lock().await = authoritative;
+            return Ok(());
+        }
+
+        // Refresh the manager snapshot after waiting for the credential lock so a local
+        // credential change cannot become stale while another writer owns the transaction.
         let (client_id, maybe_credentials) = {
             let manager = self.inner.authorization_manager.clone();
             let guard = manager.lock().await;
