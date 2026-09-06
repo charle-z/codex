@@ -40,6 +40,15 @@ impl ThreadRequestProcessor {
 
         self.validate_root_thread_delete(thread_id, thread_ids.len() > 1)
             .await?;
+        if let Some(state_db) = self.state_db.as_ref() {
+            state_db
+                .ensure_strict_thread_delete_available()
+                .map_err(|err| {
+                    internal_error(format!(
+                        "failed to prepare app-server state deletion for {thread_id}: {err}"
+                    ))
+                })?;
+        }
         for thread_id_to_delete in thread_ids.iter().copied() {
             self.prepare_thread_for_delete(thread_id_to_delete).await;
         }

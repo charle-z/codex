@@ -979,6 +979,8 @@ An archived thread will not appear in `thread/list` unless `archived` is set to 
 
 Use `thread/delete` to hard-delete a thread and its spawned descendant threads. Existing rollout files and associated metadata must be removed before the request succeeds; missing rollout files are treated as already deleted.
 
+If the logs database is busy or locked during startup, the server can start without persistent logging. In that state, `thread/delete` returns JSON-RPC error `-32603` before modifying rollouts or thread state. Restart the server after the database contention is resolved to restore persistent logging and deletion.
+
 ```json
 { "method": "thread/delete", "id": 23, "params": { "threadId": "thr_b" } }
 { "id": 23, "result": {} }
