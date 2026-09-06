@@ -29,7 +29,7 @@ impl App {
                 tui,
                 &self.config,
                 &self.local_settings,
-                /*show_all*/ false,
+                /*show_all*/ self.resume_picker_show_all,
                 /*include_non_interactive*/ false,
                 picker_app_server,
                 app_server.request_handle(),
