@@ -679,6 +679,30 @@ impl OAuthPersistor {
         reason = "AuthorizationManager async access must be serialized through its mutex"
     )]
     pub(crate) async fn persist_if_needed(&self) -> Result<()> {
+        // This hook runs after ordinary MCP operations, so keep the no-change path entirely
+        // in-memory. Cross-process coordination is only needed when RMCP actually changed the
+        // credential that this client would otherwise persist or remove.
+        let (client_id, maybe_credentials) = {
+            let manager = self.inner.authorization_manager.clone();
+            let guard = manager.lock().await;
+            guard.get_credentials().await
+        }?;
+        let locally_changed = {
+            let last_credentials = self.inner.last_credentials.lock().await;
+            match maybe_credentials.as_ref() {
+                Some(credentials) => {
+                    let token_response = WrappedOAuthTokenResponse(credentials.clone());
+                    last_credentials.as_ref().is_none_or(|previous| {
+                        previous.client_id != client_id || previous.token_response != token_response
+                    })
+                }
+                None => last_credentials.is_some(),
+            }
+        };
+        if !locally_changed {
+            return Ok(());
+        }
+
         let _lock =
             RefreshCredentialLock::acquire_for_server(&self.inner.server_name, &self.inner.url)
                 .await?;
@@ -701,7 +725,9 @@ impl OAuthPersistor {
             if let Some(tokens) = authoritative.as_ref() {
                 refresh_transaction::install_tokens_in_manager_guard(&mut guard, tokens)
                     .await
-                    .context("failed to adopt authoritative OAuth credentials before persistence")?;
+                    .context(
+                        "failed to adopt authoritative OAuth credentials before persistence",
+                    )?;
             } else {
                 guard.set_credential_store(InMemoryCredentialStore::new());
             }
