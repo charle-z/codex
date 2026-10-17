@@ -1618,7 +1618,7 @@ async fn forked_thread_session_start_hook_uses_fork_source() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
     let server = start_mock_server().await;
-    let _responses = mount_sse_sequence(
+    let responses = mount_sse_sequence(
         &server,
         vec![
             sse(vec![
@@ -1639,9 +1639,23 @@ async fn forked_thread_session_start_hook_uses_fork_source() -> Result<()> {
         .with_pre_build_hook(|home| {
             write_session_start_and_user_prompt_submit_order_hooks(home)
                 .expect("failed to write hook ordering fixtures");
+            let hooks_path = home.join("hooks.json");
+            let mut hooks: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            write_session_start_hook_with_context(home, "startup-context-for-fork-regression")
+                .expect("failed to write startup context fixture");
+            let mut context_hooks: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            let mut startup_hook = context_hooks["hooks"]["SessionStart"][0].take();
+            startup_hook["matcher"] = serde_json::json!("startup");
+            hooks["hooks"]["SessionStart"]
+                .as_array_mut()
+                .unwrap()
+                .push(startup_hook);
+            fs::write(hooks_path, hooks.to_string()).expect("write combined hook fixtures");
         })
         .with_config(trust_discovered_hooks);
-    let test = builder.build(&server).await?;
+    let test = builder.build_with_auto_env(&server).await?;
 
     test.submit_turn("parent prompt").await?;
     test.codex.flush_rollout().await?;
@@ -1677,6 +1691,19 @@ async fn forked_thread_session_start_hook_uses_fork_source() -> Result<()> {
         })
         .collect::<Vec<_>>();
     assert_eq!(session_start_sources, vec!["startup", "fork"]);
+
+    let context_copies: Vec<usize> = responses
+        .requests()
+        .iter()
+        .map(|request| {
+            request
+                .message_input_texts("developer")
+                .iter()
+                .map(|message| message.matches("startup-context-for-fork-regression").count())
+                .sum()
+        })
+        .collect();
+    assert_eq!(context_copies, vec![1, 1]);
 
     forked.shutdown_and_wait().await?;
     Ok(())
