@@ -149,6 +149,15 @@ impl OAuthPersistor {
             .refresh_token()
             .is_none_or(|refresh_token| refresh_token.secret().trim().is_empty())
         {
+            // Another serialized refresher may have already invalidated this credential. Adopt
+            // the authoritative unrefreshable state so a stale live manager cannot retain and
+            // later replay the rejected refresh capability.
+            let manager = self.inner.authorization_manager.clone();
+            let mut guard = manager.lock().await;
+            install_tokens_in_manager_guard(&mut guard, &latest)
+                .await
+                .context("failed to adopt authoritative unrefreshable OAuth credentials")?;
+            *self.inner.last_credentials.lock().await = Some(latest);
             return Err(AuthError::AuthorizationRequired).with_context(|| {
                 format!(
                     "OAuth tokens for server {} cannot be refreshed; authorization required",
@@ -182,6 +191,59 @@ impl OAuthPersistor {
                     error = %error,
                     "MCP OAuth refresh token was rejected; reauthorization required"
                 );
+                let mut rejected = latest.clone();
+                rejected.token_response.0.set_refresh_token(None);
+
+                match self.inner.credential_store.save(
+                    keyring_store,
+                    &self.inner.server_name,
+                    &rejected,
+                ) {
+                    Ok(()) => {
+                        if let Err(install_error) =
+                            install_tokens_in_manager_guard(&mut guard, &rejected).await
+                        {
+                            // Durable state is already safe. Fail closed in memory as well rather
+                            // than leave the rejected capability installed in this process.
+                            guard.set_credential_store(InMemoryCredentialStore::new());
+                            *self.inner.last_credentials.lock().await = None;
+                            return Err(install_error).context(
+                                "rejected OAuth refresh token state was persisted but could not be installed in the authorization manager",
+                            );
+                        }
+                        *self.inner.last_credentials.lock().await = Some(rejected);
+                    }
+                    Err(save_error) => {
+                        warn!(
+                            error = %save_error,
+                            "failed to persist rejected OAuth refresh-token state; removing the authoritative credential instead"
+                        );
+                        let delete_result = self.inner.credential_store.delete(
+                            keyring_store,
+                            &self.inner.server_name,
+                            &self.inner.url,
+                        );
+
+                        // Whatever happens to durable storage, the rejected capability must not
+                        // remain reusable by this live process.
+                        guard.set_credential_store(InMemoryCredentialStore::new());
+                        *self.inner.last_credentials.lock().await = None;
+
+                        if let Err(delete_error) = delete_result {
+                            anyhow::bail!(
+                                "failed to persist rejected OAuth refresh-token state for server {}: {save_error}; failed to remove the rejected OAuth credential: {delete_error}",
+                                self.inner.server_name
+                            );
+                        }
+
+                        return Err(AuthError::AuthorizationRequired).with_context(|| {
+                            format!(
+                                "failed to refresh OAuth tokens for server {}: {error}; rejected refresh-token state could not be persisted and the credential was removed instead: {save_error}",
+                                self.inner.server_name
+                            )
+                        });
+                    }
+                }
                 return Err(AuthError::AuthorizationRequired).with_context(|| {
                     format!(
                         "failed to refresh OAuth tokens for server {}: {error}",
@@ -253,7 +315,7 @@ impl OAuthPersistor {
     }
 }
 
-async fn install_tokens_in_manager_guard(
+pub(super) async fn install_tokens_in_manager_guard(
     authorization_manager: &mut AuthorizationManager,
     tokens: &StoredOAuthTokens,
 ) -> Result<()> {
