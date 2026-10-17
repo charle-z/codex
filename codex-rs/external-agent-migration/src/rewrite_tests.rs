@@ -44,6 +44,22 @@ fn preserves_source_specific_urls_and_dotted_identifiers() {
 }
 
 #[test]
+fn preserves_source_specific_terms_anywhere_inside_urls() {
+    let input = concat!(
+        "See https://example.test/?agent=claude#claude, ",
+        "<https://example.test/search?q=Claude>, and claude://session?id=claude. ",
+        "Use Claude."
+    );
+    let expected = concat!(
+        "See https://example.test/?agent=claude#claude, ",
+        "<https://example.test/search?q=Claude>, and claude://session?id=claude. ",
+        "Use Codex."
+    );
+
+    assert_eq!(CLAUDE_PROFILE.rewrite(input), expected);
+}
+
+#[test]
 fn rewrites_standalone_doc_name_but_not_path_qualified_doc_name() {
     assert_eq!(
         PROFILE.rewrite("SOURCE.md lives beside ../SOURCE.md and $HOME/SOURCE.md."),
